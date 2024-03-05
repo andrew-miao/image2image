@@ -100,6 +100,57 @@ base = {
         "per_prompt_stats_bufsize": 32,
         "per_prompt_stats_min_count": 16,
     },
+    "dream_ppo": {
+        # misc
+        "loadpath": "",
+        "load_epoch": "latest",
+        "modelpath": "models/pg",
+        "savepath": "f:models/pg",
+        "pretrained_model": "duongna/stable-diffusion-v1-4-flax",
+        "resolution": 512,
+        "filter_field": None,
+        "guidance_scale": 5.0,
+        "dtype": "float32",
+        "cache": "cache",
+        "verbose": False,
+        "seed": 0,
+        "iteration": 0,
+        # DreamBooth
+        "instance_data_dir": None,         # path to the instance images
+        "instance_prompt": None,           # prompt for the instance images
+        "class_prompt": None,              # prompt for the class images
+        "output_dir": None,                # path to the output directory
+        "logging_dir": "logs",             # path to the logging directory
+        "with_prior_preservation": False,  # whether to use prior preservation
+        "num_class_images": 100,           # number of class images for prior preservation
+        "center_crop": False,              # whether to use center crop the images to the resolution
+        # sampling
+        "sample_batch_size": 8,  # per device
+        "num_sample_batches_per_epoch": 1,
+        "n_inference_steps": 50,
+        "identical_batch": False,
+        "evaluate": False,
+        "eta": 1.0,
+        # training
+        "train_batch_size": 2,  # per device
+        "train_accumulation_steps": 1,
+        "num_train_epochs": 200,
+        "num_inner_epochs": 1,  # inner epochs of PPO training (# of times to loop over collected data)
+        "ppo_clip_range": 1e-4,
+        "train_cfg": True,
+        "learning_rate": 1e-5,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "weight_decay": 1e-4,
+        "epsilon": 1e-8,
+        "max_grad_norm": 1.0,
+        "save_freq": 10,
+        "optimizer": "adamw",
+        "train_timestep_ratio": 1.0,
+        "prompt_kwargs": {},
+        "per_prompt_stats_bufsize": 32,
+        "per_prompt_stats_min_count": 16,
+    },
 }
 
 

@@ -5,10 +5,14 @@ import os
 from pathlib import Path
 import json
 from functools import partial
+from concurrent import futures
+import time
 
 import jax
 import jax.numpy as jnp
 from jax.experimental.compilation_cache import compilation_cache
+from jax.experimental import multihost_utils
+from jax.experimental.compilation_cache import compilation_cache as cc
 import numpy as np
 import optax
 import torch
@@ -17,13 +21,12 @@ import transformers
 from flax import jax_utils
 from flax.training import train_state
 from flax.training.common_utils import shard
-from huggingface_hub.utils import insecure_hashlib
-from jax.experimental.compilation_cache import compilation_cache as cc
+from flax.training.checkpoints import save_checkpoint_multiprocess
+
 from PIL import Image
-from torch.utils.data import Dataset
-from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import CLIPImageProcessor, CLIPTokenizer, FlaxCLIPTextModel
+from transformers import CLIPTokenizer
+from matplotlib import pyplot as plt
 
 from diffusers import (
     FlaxAutoencoderKL,
@@ -51,10 +54,13 @@ logger = logging.getLogger(__name__)
 
 class Parser(ddpo.utils.Parser):
     config: str = "config.base"
-    
-def get_params_to_save(params):
-    return jax.device_get(jax.tree_util.tree_map(lambda x: x[0], params))
 
+p_train_step = jax.pmap(
+    ddpo.training.policy_gradient.train_step,
+    axis_name="batch",
+    donate_argnums=0,
+    static_broadcasted_argnums=(3, 4, 5, 6, 7, 8),
+)
 
 def main():
     args = Parser().parse_args("dream_ppo")
@@ -143,12 +149,14 @@ def main():
     def collate_fn(examples):
         input_ids = [example["instance_prompt_ids"] for example in examples]
         pixel_values = [example["instance_images"] for example in examples]
+        prompts = [example["instance_prompts"] for example in examples]
 
         # Concat class and instance examples for prior preservation.
         # We do this to avoid doing two forward passes.
         if args.with_prior_preservation:
             input_ids += [example["class_prompt_ids"] for example in examples]
             pixel_values += [example["class_images"] for example in examples]
+            prompts += [example["class_prompts"] for example in examples]
 
         pixel_values = torch.stack(pixel_values)
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
@@ -160,6 +168,7 @@ def main():
         batch = {
             "input_ids": input_ids,
             "pixel_values": pixel_values,
+            "prompts": prompts,
         }
         batch = {k: v.numpy() for k, v in batch.items()}
         return batch
@@ -239,7 +248,7 @@ def main():
     # NOTE(kvablack) optax.MultiSteps takes way more memory than necessary; this
     # class is a workaround that requires compiling twice. there may be a better
     # way but this works.
-    train_state = ddpo.training.policy_gradient.AccumulatingTrainState(
+    unet_state = ddpo.training.policy_gradient.AccumulatingTrainState(
         step=0,
         apply_fn=pipeline.unet.apply,
         params=params["unet"],
@@ -249,12 +258,27 @@ def main():
         n_acc=0,
     )
     # ----------------- Replication ----------------- #
-    train_state = jax_utils.replicate(train_state)
+    unet_state = jax_utils.replicate(unet_state)
     sampling_scheduler_params = jax_utils.replicate(params["scheduler"])
     noise_scheduler_state = jax_utils.replicate(noise_scheduler_state)
+    params["vae"] = jax_utils.replicate(params["vae"])
+    params["text_encoder"] = jax_utils.replicate(params["text_encoder"])
 
-    # -------------------------- setup ------------------------#
+    # -------------------------- Setup ------------------------#
     timer = ddpo.utils.Timer()
+    # -------------------------- Functions ------------------------ #
+    @partial(jax.pmap)
+    def vae_encode(images, vae_params, sample_rng):
+        vae_outputs = pipeline.vae.apply(
+            {"params": vae_params}, 
+            images,
+            deterministic=True, 
+            method=pipeline.vae.encode
+        )
+        latents = vae_outputs.latent_dist.sample(sample_rng)
+        latents = jnp.transpose(latents, (0, 2, 3, 1))
+        latents = latents * 0.18215  # latent scale_factor, details: https://github.com/CompVis/stable-diffusion/blob/main/configs/stable-diffusion/v1-inference.yaml#L17
+        return latents
 
     @partial(jax.pmap)
     def vae_decode(latents, vae_params):
@@ -269,10 +293,10 @@ def main():
     # text encode on CPU to save memory
     @partial(jax.jit, backend="cpu")
     def text_encode(input_ids):
-        return pipeline.text_encoder(input_ids, params=params["text_encoder"])[0]
+        return pipeline.text_encoder(input_ids, params=params["text_encoder"], train=False)[0]
 
     # make uncond prompts and embed them
-    uncond_prompt_ids = ddpo.datasets.make_uncond_text(pipeline.tokenizer, 1)
+    uncond_prompt_ids = ddpo.datasets.make_uncond_text(tokenizer, 1)
     timer()
     uncond_prompt_embeds = text_encode(uncond_prompt_ids).squeeze()
     print(f"[ embed uncond prompts ] in {timer():.2f}s")
@@ -283,112 +307,24 @@ def main():
     sample_uncond_prompt_embeds = jax_utils.replicate(sample_uncond_prompt_embeds)
     train_uncond_prompt_embeds = sample_uncond_prompt_embeds[:, : args.train_batch_size]
 
-    train_rng, sample_rng = jax.random.split(rng)
+    rng, sample_rng = jax.random.split(rng)
 
     #TODO: finish trainining loop and callbacks.
+    # -------------------------- Callbacks ------------------------ #
+    callback_fns = {
+        args.filter_field: ddpo.training.callback_fns[args.filter_field](),
+    }
 
-    def train_step(unet_state, text_encoder_state, vae_params, batch, train_rng):
-        dropout_rng, sample_rng, new_train_rng = jax.random.split(train_rng, 3)
+    executor = futures.ThreadPoolExecutor(max_workers=2)
+    
 
-        if args.train_text_encoder:
-            params = {"text_encoder": text_encoder_state.params, "unet": unet_state.params}
-        else:
-            params = {"unet": unet_state.params}
+    if args.per_prompt_stats_bufsize is not None:
+        per_prompt_stats = ddpo.utils.PerPromptStats(
+            bufsize=args.per_prompt_stats_bufsize, n_prompts=args.n_prompts
+        )
 
-        def compute_loss(params):
-            # Convert images to latent space
-            vae_outputs = vae.apply(
-                {"params": vae_params}, batch["pixel_values"], deterministic=True, method=vae.encode
-            )
-            latents = vae_outputs.latent_dist.sample(sample_rng)
-            # (NHWC) -> (NCHW)
-            latents = jnp.transpose(latents, (0, 3, 1, 2))
-            latents = latents * vae.config.scaling_factor
 
-            # Sample noise that we'll add to the latents
-            noise_rng, timestep_rng = jax.random.split(sample_rng)
-            noise = jax.random.normal(noise_rng, latents.shape)
-            # Sample a random timestep for each image
-            bsz = latents.shape[0]
-            timesteps = jax.random.randint(
-                timestep_rng,
-                (bsz,),
-                0,
-                noise_scheduler.config.num_train_timesteps,
-            )
-
-            # Add noise to the latents according to the noise magnitude at each timestep
-            # (this is the forward diffusion process)
-            noisy_latents = noise_scheduler.add_noise(noise_scheduler_state, latents, noise, timesteps)
-
-            # Get the text embedding for conditioning
-            if args.train_text_encoder:
-                encoder_hidden_states = text_encoder_state.apply_fn(
-                    batch["input_ids"], params=params["text_encoder"], dropout_rng=dropout_rng, train=True
-                )[0]
-            else:
-                encoder_hidden_states = text_encoder(
-                    batch["input_ids"], params=text_encoder_state.params, train=False
-                )[0]
-
-            # Predict the noise residual
-            model_pred = unet.apply(
-                {"params": params["unet"]}, noisy_latents, timesteps, encoder_hidden_states, train=True
-            ).sample
-
-            # Get the target for loss depending on the prediction type
-            if noise_scheduler.config.prediction_type == "epsilon":
-                target = noise
-            elif noise_scheduler.config.prediction_type == "v_prediction":
-                target = noise_scheduler.get_velocity(noise_scheduler_state, latents, noise, timesteps)
-            else:
-                raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-
-            if args.with_prior_preservation:
-                # Chunk the noise and noise_pred into two parts and compute the loss on each part separately.
-                model_pred, model_pred_prior = jnp.split(model_pred, 2, axis=0)
-                target, target_prior = jnp.split(target, 2, axis=0)
-
-                # Compute instance loss
-                loss = (target - model_pred) ** 2
-                loss = loss.mean()
-
-                # Compute prior loss
-                prior_loss = (target_prior - model_pred_prior) ** 2
-                prior_loss = prior_loss.mean()
-
-                # Add the prior loss to the instance loss.
-                loss = loss + args.prior_loss_weight * prior_loss
-            else:
-                loss = (target - model_pred) ** 2
-                loss = loss.mean()
-
-            return loss
-
-        grad_fn = jax.value_and_grad(compute_loss)
-        loss, grad = grad_fn(params)
-        grad = jax.lax.pmean(grad, "batch")
-
-        new_unet_state = unet_state.apply_gradients(grads=grad["unet"])
-        if args.train_text_encoder:
-            new_text_encoder_state = text_encoder_state.apply_gradients(grads=grad["text_encoder"])
-        else:
-            new_text_encoder_state = text_encoder_state
-
-        metrics = {"loss": loss}
-        metrics = jax.lax.pmean(metrics, axis_name="batch")
-
-        return new_unet_state, new_text_encoder_state, metrics, new_train_rng
-
-    # Create parallel version of the train step
-    p_train_step = jax.pmap(train_step, "batch", donate_argnums=(0, 1))
-
-    # Replicate the train state on each device
-    unet_state = jax_utils.replicate(unet_state)
-    text_encoder_state = jax_utils.replicate(text_encoder_state)
-    vae_params = jax_utils.replicate(vae_params)
-
-    # Train!
+    # -------------------------- Training Loop ------------------------ #
     num_update_steps_per_epoch = math.ceil(len(train_dataloader))
 
     # Scheduler and math around the number of training steps.
@@ -402,71 +338,220 @@ def main():
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel & distributed) = {total_train_batch_size}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
 
-    def checkpoint(step=None):
-        # Create the pipeline using the trained modules and save it.
-        scheduler, _ = FlaxPNDMScheduler.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="scheduler")
-        safety_checker = FlaxStableDiffusionSafetyChecker.from_pretrained(
-            "CompVis/stable-diffusion-safety-checker", from_pt=True
-        )
-        pipeline = FlaxStableDiffusionPipeline(
-            text_encoder=text_encoder,
-            vae=vae,
-            unet=unet,
-            tokenizer=tokenizer,
-            scheduler=scheduler,
-            safety_checker=safety_checker,
-            feature_extractor=CLIPImageProcessor.from_pretrained("openai/clip-vit-base-patch32"),
-        )
-
-        outdir = os.path.join(args.output_dir, str(step)) if step else args.output_dir
-        pipeline.save_pretrained(
-            outdir,
-            params={
-                "text_encoder": get_params_to_save(text_encoder_state.params),
-                "vae": get_params_to_save(vae_params),
-                "unet": get_params_to_save(unet_state.params),
-                "safety_checker": safety_checker.params,
-            },
-        )
-
-        
-
-    global_step = 0
-
+    mean_rewards, std_rewards = [], []
     epochs = tqdm(range(args.num_train_epochs), desc="Epoch ... ", position=0)
     for epoch in epochs:
-        # ======================== Training ================================
-
-        train_metrics = []
-
-        steps_per_epoch = len(train_dataset) // total_train_batch_size
-        train_step_progress_bar = tqdm(total=steps_per_epoch, desc="Training...", position=1, leave=False)
-        # train
-        for batch in train_dataloader:
+        # ------------------------- Prepare RL experience ----------------------- #
+        print(f"Epoch {epoch}, preparing RL experience...")
+        experience = []
+        rng, sample_rng = jax.random.split(rng)
+        for i, batch in enumerate(train_dataloader):
             batch = shard(batch)
-            unet_state, text_encoder_state, train_metric, train_rngs = p_train_step(
-                unet_state, text_encoder_state, vae_params, batch, train_rngs
+            # Encode input images
+            latents = vae_encode(batch["pixel_values"], params["vae"], sample_rng)
+            # Sample noise for adding to the latents
+            noise_rng, sample_rng = jax.random.split(sample_rng)
+            noise = jax.random.normal(noise_rng, latents.shape, dtype=latents.dtype)
+            # Encode the input prompts
+            prompts_embeds = text_encode(batch["input_ids"])
+            # DDIM steps
+            sampling_params = {
+                "unet": unet_state.params,
+                "scheduler": sampling_scheduler_params,
+            }
+            final_latents, latents, next_latents, log_probs, timesteps = pipeline(
+                prompts_embeds,
+                sample_uncond_prompt_embeds,
+                sampling_params,
+                sample_rng,
+                args.n_inference_steps,
+                jit=True,
+                height=args.resolution,
+                width=args.resolution,
+                guidance_scale=args.guidance_scale,
+                eta=args.eta,
             )
-            train_metrics.append(train_metric)
+            # Decode latents
+            generate_images = vae_decode(final_latents, params["vae"])
+            generate_images = jax.device_get(ddpo.utils.unshard(generate_images))
+            # Evaluate callbacks
+            callbacks = executor.submit(
+                ddpo.training.evaluate_callbacks,
+                callback_fns,
+                generate_images,
+                batch["prompts"],
+                metadata=None
+            )
+            time.sleep(0)
+            # Add experience to the buffer
+            experience.append(
+                {   
+                    "prompts": np.array(batch["prompts"]),
+                    "prompts_embeds": np.array(prompts_embeds),
+                    "latents": jax.device_get(ddpo.utils.unshard(latents)),
+                    "next_latents": jax.device_get(ddpo.utils.unshard(next_latents)),
+                    "log_probs": jax.device_get(ddpo.utils.unshard(log_probs)),
+                    "timesteps": jax.device_get(ddpo.utils.unshard(timesteps)),
+                    "callbacks": callbacks,
+                }
+            )
+            # Save a sample
+            pipeline.numpy_to_pil(generate_images[0])[0].save(
+                ddpo.utils.fs.join_and_create(
+                    localpath, f"samples/{worker_id}_{epoch}_{i}.png"
+                )
+            )
 
-            train_step_progress_bar.update(jax.local_device_count())
+        # Wait for the callbacks to finish
+        for exp in experience:
+            exp["rewards"], exp["callback_info"] = exp["callbacks"].result()[
+                args.filter_field
+            ]
+            del exp["callbacks"]
 
-            global_step += 1
-            if jax.process_index() == 0 and args.save_steps and global_step % args.save_steps == 0:
-                checkpoint(global_step)
-            if global_step >= args.max_train_steps:
-                break
+        # Collate samples into a single dictionary
+        # shape: (num_sample_batches_per_epoch * sample_batch_size * n_devices)
+        experience = jax.tree_map(lambda *xs: np.concatenate(xs), *experience)
+        # allgather rewards for multi-host training
+        rewards = np.array(
+            multihost_utils.process_allgather(experience["rewards"], tiled=True)
+        )
+        # -------------------------- Computing Advantages ------------------------ #
+        if args.per_prompt_stats_bufsize is not None:
+            prompt_ids = tokenizer(
+                experience["prompts"].tolist(), padding="max_length", return_tensors="np"
+            ).input_ids
+            prompt_ids = multihost_utils.process_allgather(prompt_ids, tiled=True)
+            prompts = np.array(
+                tokenizer.batch_decode(prompt_ids, skip_special_tokens=True)
+            )
 
-        train_metric = jax_utils.unreplicate(train_metric)
+            advantages = per_prompt_stats.update(prompts, rewards)
 
-        train_step_progress_bar.close()
-        epochs.write(f"Epoch... ({epoch + 1}/{args.num_train_epochs} | Loss: {train_metric['loss']})")
+            if jax.process_index == 0:
+                np.save(
+                    ddpo.utils.fs.join_and_create(
+                        localpath, f"per_prompt_stats/{worker_id}_{epoch}.npy"
+                    ),
+                    per_prompt_stats.get_stats(),
+                )
+        else:
+            advantages = (rewards - np.mean(rewards)) / (np.std(rewards) + 1e-08)
 
-    if jax.process_index() == 0:
-        checkpoint()
+        experience["advantages"] = advantages.reshape(jax.process_count(), -1)[worker_id]
+        print(f"mean rewards: {np.mean(rewards):.4f}")
 
+        mean_rewards.append(np.mean(rewards))
+        std_rewards.append(np.std(rewards))
+        # save data for future analysis
+        np.save(
+            ddpo.utils.fs.join_and_create(localpath, f"rewards/{worker_id}_{epoch}.npy"),
+            experience["rewards"],
+        )
+        np.save(
+            ddpo.utils.fs.join_and_create(localpath, f"prompts/{worker_id}_{epoch}.npy"),
+            experience["prompts"],
+        )
+        np.save(
+            ddpo.utils.fs.join_and_create(
+                localpath, f"callback_info/{worker_id}_{epoch}.npy"
+            ),
+            experience["callback_info"],
+        )
+        del experience["prompts"]
+        del experience["callback_info"]
+        del experience["rewards"]
+
+        for inner_epoch in range(args.num_inner_epochs):
+            total_batch_size, num_timesteps = experience["log_probs"].shape
+            # shuffle samples along batch dimension
+            perm = np.random.permutation(total_batch_size)
+            experience = jax.tree_map(lambda x: x[perm], experience)
+            # shuffle along time dimension
+            perms = np.array(
+                [np.random.permutation(num_timesteps) for _ in range(total_batch_size)]
+            )
+            for key in ["log_probs", "latents", "next_latents", "timesteps"]:
+                experience[key] = experience[key][np.arange(total_batch_size)[:, None], perms]
+            # split experience into batches
+            experience_train = jax.tree_map(
+                lambda x: x.reshape(-1, n_devices, args.train_batch_size, *x.shape[1:]),
+                experience,
+            )
+            experience_train = [
+                dict(zip(experience_train, x)) for x in zip(*experience_train.values())
+            ]  # Need to check
+            # --------------------- PPO --------------------- #
+            num_train_timesteps = int(num_timesteps * args.train_timestep_ratio)
+            all_infos = []
+            for i, replay in tqdm.tqdm(
+                list(enumerate(experience_train)),  # Need to check
+                desc=f"PPO inner Epoch {inner_epoch}...",
+            ):
+                for j in range(num_train_timesteps):
+                    batch = {
+                        "prompt_embeds": replay["prompts_embeds"],
+                        "uncond_embeds": train_uncond_prompt_embeds,
+                        "advantages": replay["advantages"],
+                        "latents": replay["latents"][:, :, j],
+                        "next_latents": replay["next_latents"][:, :, j],
+                        "log_probs": replay["log_probs"][:, :, j],
+                        "timesteps": replay["timesteps"][:, :, j],
+                    }
+
+                    do_opt_update = (j == num_train_timesteps - 1) and ((i + 1) % args.train_accumulation_steps == 0)
+                    if do_opt_update:
+                        print(f"Optimizing at {i}th batch and {j}th timestep")
+                    
+                    unet_state, info = p_train_step(
+                        unet_state,
+                        batch,
+                        noise_scheduler_state,
+                        pipeline.scheduler,
+                        args.train_cfg,
+                        args.guidance_scale,
+                        args.ppo_clip_range,
+                        do_opt_update,
+                    )
+                    multihost_utils.assert_equal(info, "infos equal")
+                    all_infos.append(
+                        jax.tree_map(lambda x: jax.device_get(x), info)
+                    )
+            all_infos = jax.tree_map(lambda *xs: np.stack(xs), *all_infos)
+            print(f"mean info: {jax.tree_map(np.mean, all_infos)}")
+            # Save training info
+            if jax.process_index() == 0:
+                np.save(
+                    ddpo.utils.fs.join_and_create(
+                        localpath, f"train_info/{worker_id}_{epoch}_{inner_epoch}.npy"
+                    ),
+                    all_infos,
+                )
+        # -------------------------- Save the model ------------------------ #
+        if (epoch + 1) % args.save_freq == 0 or epoch == args.num_train_epochs - 1:
+            save_checkpoint_multiprocess(
+                os.path.join(args.savepath, "checkpoints"),
+                jax_utils.unreplicate(unet_state.params),
+                step=epoch,
+                keep=1e6,
+                overwrite=True,
+            )
+            print(f"Model saved at epoch {epoch + 1}")
+        
+        # plot learning curve
+        if jax.process_index() == 0:
+            plt.clf()
+            plt.plot(mean_rewards)
+            plt.fill_between(
+                range(len(mean_rewards)),
+                np.array(mean_rewards) - np.array(std_rewards),
+                np.array(mean_rewards) + np.array(std_rewards),
+                alpha=0.2,
+            )
+            plt.grid()
+            plt.savefig(os.path.join(localpath, f"log_{worker_id}.png"))
+            ddpo.utils.async_to_bucket(localpath, args.savepath)
 
 if __name__ == "__main__":
     main()

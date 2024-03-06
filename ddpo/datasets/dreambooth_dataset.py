@@ -71,6 +71,8 @@ class DreamBoothDataset(Dataset):
             max_length=self.tokenizer.model_max_length,
         ).input_ids
 
+        example["instance_prompts"] = self.instance_prompt
+
         if self.class_data_root:
             class_image = Image.open(self.class_images_path[index % self.num_class_images])
             if not class_image.mode == "RGB":
@@ -82,6 +84,8 @@ class DreamBoothDataset(Dataset):
                 truncation=True,
                 max_length=self.tokenizer.model_max_length,
             ).input_ids
+
+            example["class_prompts"] = self.class_prompt
 
         return example
     

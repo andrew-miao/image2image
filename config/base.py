@@ -97,8 +97,8 @@ base = {
         "optimizer": "adamw",
         "train_timestep_ratio": 1.0,
         "prompt_kwargs": {},
-        "per_prompt_stats_bufsize": 32,
-        "per_prompt_stats_min_count": 16,
+        "per_prompt_stats_bufsize": None,
+        "per_prompt_stats_min_count": None,
     },
     "dream_ppo": {
         # misc

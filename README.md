@@ -17,13 +17,13 @@ This codebase has been tested on [Google Cloud TPUs](https://cloud.google.com/tp
 
 ```
 conda env create -f environment_tpu.yml
-conda activate ddpo-tpu
+conda activate dream-ppo-tpu
 pip install -e .
 ```
 
-## Running DDPO
+## Running DreamBooth PPO
 ```
-python pipeline/policy_gradient.py --dataset compressed-animals
+python pipeline/dream_ppo.py --dataset="dreambooth_dog"
 ```
 
 The `--dataset` flag can be replaced by any of the configs defined in `config/base.py`.

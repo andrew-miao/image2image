@@ -36,6 +36,7 @@ from diffusers import (
 )
 
 import ddpo
+from ddpo.utils.stat_tracking import PerPromptStatTracker
 from ddpo.diffusers_patch.scheduling_ddim_flax import FlaxDDIMScheduler
 from ddpo.diffusers_patch.pipeline_flax_stable_diffusion import FlaxStableDiffusionPipeline
 
@@ -44,9 +45,6 @@ from diffusers.utils import check_min_version
 from ddpo.datasets import DreamBoothDataset, PromptDataset
 
 
-# Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-check_min_version("0.27.0.dev0")
-
 # Cache compiled models across invocations of this script.
 cc.initialize_cache(os.path.expanduser("~/.cache/jax/compilation_cache"))
 
@@ -54,6 +52,7 @@ logger = logging.getLogger(__name__)
 
 class Parser(ddpo.utils.Parser):
     config: str = "config.base"
+    dataset: str = "dreambooth"
 
 p_train_step = jax.pmap(
     ddpo.training.policy_gradient.train_step,
@@ -65,7 +64,12 @@ p_train_step = jax.pmap(
 def main():
     args = Parser().parse_args("dream_ppo")
     transformers.set_seed(args.seed)
-    compilation_cache.initialize_cache(args.cache)  # only works on TPU
+
+    try:
+        compilation_cache.initialize_cache(args.cache)
+    except AssertionError as e:
+        print(f"Warning: {e}")
+
 
     if jax.process_index() == 0:
         transformers.utils.logging.set_verbosity_info()
@@ -123,69 +127,7 @@ def main():
 
     logging.info(f"Worker {worker_id} is logging to {localpath}")
 
-    # Handle the repository creation
-    if jax.process_index() == 0:
-        if args.output_dir is not None:
-            os.makedirs(args.output_dir, exist_ok=True)
-
-    # Load the tokenizer and add the placeholder token as a additional special token
-    
-    tokenizer = CLIPTokenizer.from_pretrained(
-        args.pretrained_model,
-        subfolder="tokenizer"
-    )
-
-    train_dataset = DreamBoothDataset(
-        instance_data_root=args.instance_data_dir,
-        instance_prompt=args.instance_prompt,
-        class_data_root=args.class_data_dir if args.with_prior_preservation else None,
-        class_prompt=args.class_prompt,
-        class_num=args.num_class_images,
-        tokenizer=tokenizer,
-        size=args.resolution,
-        center_crop=args.center_crop,
-    )
-
-    def collate_fn(examples):
-        input_ids = [example["instance_prompt_ids"] for example in examples]
-        pixel_values = [example["instance_images"] for example in examples]
-        prompts = [example["instance_prompts"] for example in examples]
-
-        # Concat class and instance examples for prior preservation.
-        # We do this to avoid doing two forward passes.
-        if args.with_prior_preservation:
-            input_ids += [example["class_prompt_ids"] for example in examples]
-            pixel_values += [example["class_images"] for example in examples]
-            prompts += [example["class_prompts"] for example in examples]
-
-        pixel_values = torch.stack(pixel_values)
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-
-        input_ids = tokenizer.pad(
-            {"input_ids": input_ids}, padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt"
-        ).input_ids
-
-        batch = {
-            "input_ids": input_ids,
-            "pixel_values": pixel_values,
-            "prompts": prompts,
-        }
-        batch = {k: v.numpy() for k, v in batch.items()}
-        return batch
-
-    total_train_batch_size = args.train_batch_size * jax.local_device_count()
-    if len(train_dataset) < total_train_batch_size:
-        raise ValueError(
-            f"Training batch size is {total_train_batch_size}, but your dataset only contains"
-            f" {len(train_dataset)} images. Please, use a larger dataset or reduce the effective batch size. Note that"
-            f" there are {jax.local_device_count()} parallel devices, so your batch size can't be smaller than that."
-        )
-
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=total_train_batch_size, shuffle=True, collate_fn=collate_fn, drop_last=True
-    )
-
-    # ----------------- Load the models ----------------- #
+        # ----------------- Load the models ----------------- #
     print("Loading models...")
     pipeline, params = ddpo.utils.load_unet(
         None,
@@ -218,6 +160,54 @@ def main():
             args.resolution // pipeline.vae_scale_factor,
             args.resolution // pipeline.vae_scale_factor,
         )
+    )
+    # ----------------- Load the dataset ----------------- #
+    print("Loading dataset...")
+    train_dataset = DreamBoothDataset(
+        instance_data_root=args.instance_data_dir,
+        instance_prompt=args.instance_prompt,
+        class_data_root=args.class_data_dir if args.with_prior_preservation else None,
+        class_prompt=args.class_prompt,
+        class_num=args.num_class_images,
+        tokenizer=pipeline.tokenizer,
+        size=args.resolution,
+        center_crop=args.center_crop,
+    )
+
+    def collate_fn(examples):
+        input_ids = [example["instance_prompt_ids"] for example in examples]
+        pixel_values = [example["instance_images"] for example in examples]
+
+        # Concat class and instance examples for prior preservation.
+        # We do this to avoid doing two forward passes.
+        if args.with_prior_preservation:
+            input_ids += [example["class_prompt_ids"] for example in examples]
+            pixel_values += [example["class_images"] for example in examples]
+
+        pixel_values = torch.stack(pixel_values)
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+
+        input_ids = pipeline.tokenizer.pad(
+            {"input_ids": input_ids}, padding="max_length", max_length=pipeline.tokenizer.model_max_length, return_tensors="np"
+        ).input_ids
+
+        batch = {
+            "input_ids": input_ids,
+            "pixel_values": pixel_values,
+        }
+        batch = {k: v.numpy() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        return batch
+
+    total_train_batch_size = args.train_batch_size * jax.local_device_count()
+    if len(train_dataset) < total_train_batch_size:
+        raise ValueError(
+            f"Training batch size is {total_train_batch_size}, but your dataset only contains"
+            f" {len(train_dataset)} images. Please, use a larger dataset or reduce the effective batch size. Note that"
+            f" there are {jax.local_device_count()} parallel devices, so your batch size can't be smaller than that."
+        )
+
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=total_train_batch_size, shuffle=True, collate_fn=collate_fn, drop_last=True
     )
 
     # ----------------- Optimization ----------------- #
@@ -261,8 +251,6 @@ def main():
     unet_state = jax_utils.replicate(unet_state)
     sampling_scheduler_params = jax_utils.replicate(params["scheduler"])
     noise_scheduler_state = jax_utils.replicate(noise_scheduler_state)
-    params["vae"] = jax_utils.replicate(params["vae"])
-    params["text_encoder"] = jax_utils.replicate(params["text_encoder"])
 
     # -------------------------- Setup ------------------------#
     timer = ddpo.utils.Timer()
@@ -296,7 +284,7 @@ def main():
         return pipeline.text_encoder(input_ids, params=params["text_encoder"], train=False)[0]
 
     # make uncond prompts and embed them
-    uncond_prompt_ids = ddpo.datasets.make_uncond_text(tokenizer, 1)
+    uncond_prompt_ids = ddpo.datasets.make_uncond_text(pipeline.tokenizer, 1)
     timer()
     uncond_prompt_embeds = text_encode(uncond_prompt_ids).squeeze()
     print(f"[ embed uncond prompts ] in {timer():.2f}s")
@@ -309,30 +297,20 @@ def main():
 
     rng, sample_rng = jax.random.split(rng)
 
-    #TODO: finish trainining loop and callbacks.
     # -------------------------- Callbacks ------------------------ #
     callback_fns = {
         args.filter_field: ddpo.training.callback_fns[args.filter_field](),
     }
 
     executor = futures.ThreadPoolExecutor(max_workers=2)
-    
 
     if args.per_prompt_stats_bufsize is not None:
-        per_prompt_stats = ddpo.utils.PerPromptStats(
-            bufsize=args.per_prompt_stats_bufsize, n_prompts=args.n_prompts
+        per_prompt_stats = PerPromptStatTracker(
+            buffer_size=args.per_prompt_stats_bufsize,
+            min_count=args.per_prompt_stats_min_count,
         )
 
-
     # -------------------------- Training Loop ------------------------ #
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader))
-
-    # Scheduler and math around the number of training steps.
-    if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
@@ -343,16 +321,14 @@ def main():
     epochs = tqdm(range(args.num_train_epochs), desc="Epoch ... ", position=0)
     for epoch in epochs:
         # ------------------------- Prepare RL experience ----------------------- #
-        print(f"Epoch {epoch}, preparing RL experience...")
+        print(f"Epoch {epoch + 1}, preparing RL experience...")
         experience = []
         rng, sample_rng = jax.random.split(rng)
         for i, batch in enumerate(train_dataloader):
+            print(f"batch = {batch}")
             batch = shard(batch)
             # Encode input images
-            latents = vae_encode(batch["pixel_values"], params["vae"], sample_rng)
-            # Sample noise for adding to the latents
-            noise_rng, sample_rng = jax.random.split(sample_rng)
-            noise = jax.random.normal(noise_rng, latents.shape, dtype=latents.dtype)
+            # latents = vae_encode(batch["pixel_values"], params["vae"], sample_rng)
             # Encode the input prompts
             prompts_embeds = text_encode(batch["input_ids"])
             # DDIM steps
@@ -376,11 +352,12 @@ def main():
             generate_images = vae_decode(final_latents, params["vae"])
             generate_images = jax.device_get(ddpo.utils.unshard(generate_images))
             # Evaluate callbacks
+            batch_prompts = batch['input_ids'].shape[0] * [args.instance_prompt]
             callbacks = executor.submit(
                 ddpo.training.evaluate_callbacks,
                 callback_fns,
                 generate_images,
-                batch["prompts"],
+                batch_prompts,
                 metadata=None
             )
             time.sleep(0)
@@ -419,12 +396,12 @@ def main():
         )
         # -------------------------- Computing Advantages ------------------------ #
         if args.per_prompt_stats_bufsize is not None:
-            prompt_ids = tokenizer(
+            prompt_ids = pipeline.tokenizer(
                 experience["prompts"].tolist(), padding="max_length", return_tensors="np"
             ).input_ids
             prompt_ids = multihost_utils.process_allgather(prompt_ids, tiled=True)
             prompts = np.array(
-                tokenizer.batch_decode(prompt_ids, skip_special_tokens=True)
+                pipeline.tokenizer.batch_decode(prompt_ids, skip_special_tokens=True)
             )
 
             advantages = per_prompt_stats.update(prompts, rewards)

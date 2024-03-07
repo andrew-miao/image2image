@@ -104,8 +104,8 @@ base = {
         # misc
         "loadpath": "",
         "load_epoch": "latest",
-        "modelpath": "models/pg",
-        "savepath": "f:models/pg",
+        "modelpath": "models/dream_ppo",
+        "savepath": "models/dream_ppo",
         "pretrained_model": "duongna/stable-diffusion-v1-4-flax",
         "resolution": 512,
         "filter_field": None,
@@ -119,7 +119,6 @@ base = {
         "instance_data_dir": None,         # path to the instance images
         "instance_prompt": None,           # prompt for the instance images
         "class_prompt": None,              # prompt for the class images
-        "output_dir": None,                # path to the output directory
         "logging_dir": "logs",             # path to the logging directory
         "with_prior_preservation": False,  # whether to use prior preservation
         "num_class_images": 100,           # number of class images for prior preservation
@@ -153,6 +152,19 @@ base = {
     },
 }
 
+dreambooth_dog = {
+    "common": {
+        "logbase": f"{user.bucket}/logs/dreambooth",
+        "filter_field": "mix",
+    },
+    "dream_ppo": {
+        "train_accumulation_steps": 2,
+        "instance_data_dir": "dog",
+        "instance_prompt": "a photo of sks dog",
+        "resolution": 512,
+        "train_batch_size": 1
+    }
+}
 
 compressed_animals = {
     "common": {

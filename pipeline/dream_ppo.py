@@ -24,7 +24,7 @@ from flax.training.common_utils import shard
 from flax.training.checkpoints import save_checkpoint_multiprocess
 
 from PIL import Image
-from tqdm.auto import tqdm
+import tqdm
 from transformers import CLIPTokenizer
 from matplotlib import pyplot as plt
 
@@ -55,7 +55,7 @@ class Parser(ddpo.utils.Parser):
     dataset: str = "dreambooth"
 
 p_train_step = jax.pmap(
-    ddpo.training.policy_gradient.train_step,
+    ddpo.training.ppo.train_step,
     axis_name="batch",
     donate_argnums=0,
     static_broadcasted_argnums=(3, 4, 5, 6, 7, 8),
@@ -175,24 +175,17 @@ def main():
     )
 
     def collate_fn(examples):
-        input_ids = [example["instance_prompt_ids"] for example in examples]
         pixel_values = [example["instance_images"] for example in examples]
 
         # Concat class and instance examples for prior preservation.
         # We do this to avoid doing two forward passes.
         if args.with_prior_preservation:
-            input_ids += [example["class_prompt_ids"] for example in examples]
             pixel_values += [example["class_images"] for example in examples]
 
         pixel_values = torch.stack(pixel_values)
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
-        input_ids = pipeline.tokenizer.pad(
-            {"input_ids": input_ids}, padding="max_length", max_length=pipeline.tokenizer.model_max_length, return_tensors="np"
-        ).input_ids
-
         batch = {
-            "input_ids": input_ids,
             "pixel_values": pixel_values,
         }
         batch = {k: v.numpy() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
@@ -207,7 +200,11 @@ def main():
         )
 
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=total_train_batch_size, shuffle=True, collate_fn=collate_fn, drop_last=True
+        train_dataset, 
+        batch_size=total_batch_size, 
+        shuffle=True, 
+        collate_fn=collate_fn, 
+        drop_last=False
     )
 
     # ----------------- Optimization ----------------- #
@@ -238,7 +235,7 @@ def main():
     # NOTE(kvablack) optax.MultiSteps takes way more memory than necessary; this
     # class is a workaround that requires compiling twice. there may be a better
     # way but this works.
-    unet_state = ddpo.training.policy_gradient.AccumulatingTrainState(
+    unet_state = ddpo.training.ppo.AccumulatingTrainState(
         step=0,
         apply_fn=pipeline.unet.apply,
         params=params["unet"],
@@ -251,6 +248,7 @@ def main():
     unet_state = jax_utils.replicate(unet_state)
     sampling_scheduler_params = jax_utils.replicate(params["scheduler"])
     noise_scheduler_state = jax_utils.replicate(noise_scheduler_state)
+    params["vae"] = jax_utils.replicate(params["vae"])
 
     # -------------------------- Setup ------------------------#
     timer = ddpo.utils.Timer()
@@ -318,29 +316,33 @@ def main():
     logger.info(f"  Total train batch size (w. parallel & distributed) = {total_train_batch_size}")
 
     mean_rewards, std_rewards = [], []
-    epochs = tqdm(range(args.num_train_epochs), desc="Epoch ... ", position=0)
+    epochs = tqdm.tqdm(range(args.num_train_epochs), desc="Epoch ... ", position=0)
     for epoch in epochs:
         # ------------------------- Prepare RL experience ----------------------- #
         print(f"Epoch {epoch + 1}, preparing RL experience...")
         experience = []
-        rng, sample_rng = jax.random.split(rng)
         for i, batch in enumerate(train_dataloader):
-            print(f"batch = {batch}")
-            batch = shard(batch)
-            # Encode input images
-            # latents = vae_encode(batch["pixel_values"], params["vae"], sample_rng)
-            # Encode the input prompts
-            prompts_embeds = text_encode(batch["input_ids"])
-            # DDIM steps
+            # ------------------------- Make prompts ----------------------- #
+            instance_prompts, class_prompts, prompts_metadata = ddpo.training.prompts.make_prompts(
+                args.prompt_fn,
+                n_devices * args.sample_batch_size,
+                identical_batch=False,
+                evaluate=False,
+            )
+            # Encode prompts
+            instance_prompt_ids = pipeline.prepare_inputs(instance_prompts)
+            instance_prompt_embeds = text_encode(instance_prompt_ids)
+            # ------------------------- DDIM Sampling ----------------------- #
+            sample_rng, sample_seed = jax.random.split(sample_rng)
             sampling_params = {
                 "unet": unet_state.params,
                 "scheduler": sampling_scheduler_params,
             }
             final_latents, latents, next_latents, log_probs, timesteps = pipeline(
-                prompts_embeds,
+                instance_prompt_embeds,
                 sample_uncond_prompt_embeds,
                 sampling_params,
-                sample_rng,
+                sample_seed,
                 args.n_inference_steps,
                 jit=True,
                 height=args.resolution,
@@ -365,7 +367,7 @@ def main():
             experience.append(
                 {   
                     "prompts": np.array(batch["prompts"]),
-                    "prompts_embeds": np.array(prompts_embeds),
+                    "prompts_embeds": np.array(instance_prompt_embeds),
                     "latents": jax.device_get(ddpo.utils.unshard(latents)),
                     "next_latents": jax.device_get(ddpo.utils.unshard(next_latents)),
                     "log_probs": jax.device_get(ddpo.utils.unshard(log_probs)),
@@ -373,6 +375,7 @@ def main():
                     "callbacks": callbacks,
                 }
             )
+            print("RL experience saved!")
             # Save a sample
             pipeline.numpy_to_pil(generate_images[0])[0].save(
                 ddpo.utils.fs.join_and_create(
@@ -465,6 +468,7 @@ def main():
             for i, replay in tqdm.tqdm(
                 list(enumerate(experience_train)),  # Need to check
                 desc=f"PPO inner Epoch {inner_epoch}...",
+                leave=False,
             ):
                 for j in range(num_train_timesteps):
                     batch = {

@@ -36,6 +36,10 @@ def make_prompts(fn_name, batch_size, identical_batch=False, **kwargs):
 
 # ---------------------------- specific experiments ----------------------------#
 
+def dreambooth_dog(evaluate=False):
+    instance_prompts = "a photo of sks dog"
+    class_prompts = "a photo of a dog"
+    return instance_prompts, class_prompts, {}
 
 def person_pet(evaluate=False):
     training_prompts = ["a photo of a person with their pet"]

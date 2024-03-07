@@ -155,6 +155,7 @@ base = {
 dreambooth_dog = {
     "common": {
         "logbase": f"{user.bucket}/logs/dreambooth",
+        "prompt_fn": "dreambooth_dog",
         "filter_field": "mix",
     },
     "dream_ppo": {

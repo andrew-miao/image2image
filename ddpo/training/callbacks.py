@@ -58,7 +58,7 @@ def vae_fn(devices=DEVICES, dtype="float32", jit=True):
 
 def mix_aesthetic_t2i_fn(devices=DEVICES, rng=0, cache="cache", jit=True, alpha=0.5):
     aesthetic_callback = aesthetic_fn(devices=devices, rng=rng, cache=cache, jit=jit)
-    consistency_callback = consistency_fn(devices=devices, jit=jit)
+    consistency_callback = consistency_fn(devices=devices, jit=False)
     
     def _mixture_fn(images, prompts, metadata):
         # Compute the aesthetic score

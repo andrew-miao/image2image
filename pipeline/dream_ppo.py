@@ -201,7 +201,7 @@ def main():
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset, 
-        batch_size=total_batch_size, 
+        batch_size=n_devices * args.sample_batch_size, 
         shuffle=True, 
         collate_fn=collate_fn, 
         drop_last=False
@@ -333,16 +333,17 @@ def main():
             instance_prompt_ids = pipeline.prepare_inputs(instance_prompts)
             instance_prompt_embeds = text_encode(instance_prompt_ids)
             # ------------------------- DDIM Sampling ----------------------- #
-            sample_rng, sample_seed = jax.random.split(sample_rng)
+            sample_rng, sample_seeds = jax.random.split(sample_rng)
+            sample_seeds = jax.random.split(sample_seeds, n_devices)
             sampling_params = {
                 "unet": unet_state.params,
                 "scheduler": sampling_scheduler_params,
             }
             final_latents, latents, next_latents, log_probs, timesteps = pipeline(
-                instance_prompt_embeds,
+                shard(instance_prompt_embeds),
                 sample_uncond_prompt_embeds,
                 sampling_params,
-                sample_seed,
+                sample_seeds,
                 args.n_inference_steps,
                 jit=True,
                 height=args.resolution,
@@ -350,23 +351,22 @@ def main():
                 guidance_scale=args.guidance_scale,
                 eta=args.eta,
             )
-            # Decode latents
+            # ---------------------- Decode latents ---------------------- #
             generate_images = vae_decode(final_latents, params["vae"])
             generate_images = jax.device_get(ddpo.utils.unshard(generate_images))
-            # Evaluate callbacks
-            batch_prompts = batch['input_ids'].shape[0] * [args.instance_prompt]
+            # ---------------------- Evaluate callbacks ---------------------- #
             callbacks = executor.submit(
                 ddpo.training.evaluate_callbacks,
                 callback_fns,
                 generate_images,
-                batch_prompts,
+                instance_prompts,
                 metadata=None
             )
             time.sleep(0)
             # Add experience to the buffer
             experience.append(
                 {   
-                    "prompts": np.array(batch["prompts"]),
+                    "prompts": np.array(instance_prompts),
                     "prompts_embeds": np.array(instance_prompt_embeds),
                     "latents": jax.device_get(ddpo.utils.unshard(latents)),
                     "next_latents": jax.device_get(ddpo.utils.unshard(next_latents)),
@@ -492,6 +492,7 @@ def main():
                         pipeline.scheduler,
                         args.train_cfg,
                         args.guidance_scale,
+                        args.eta,
                         args.ppo_clip_range,
                         do_opt_update,
                     )

@@ -67,8 +67,8 @@ def mix_aesthetic_t2i_fn(devices=DEVICES, rng=0, cache="cache", jit=True, alpha=
         consistency_score, _ = consistency_callback(images, prompts, metadata)
         
         # Combine the scores
-        mixture_score = alpha * jax.nn.tanh(aesthetic_score) \
-                     + (1 - alpha) * jax.nn.tanh(consistency_score)
+        mixture_score = alpha * jax.nn.tanh(aesthetic_score / 10.) \
+                     + (1 - alpha) * jax.nn.tanh(consistency_score / 10.)
         return mixture_score, {}
     
     return _mixture_fn

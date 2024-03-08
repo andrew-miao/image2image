@@ -163,7 +163,8 @@ dreambooth_dog = {
         "instance_data_dir": "dog",
         "instance_prompt": "a photo of sks dog",
         "resolution": 512,
-        "train_batch_size": 1
+        "train_batch_size": 1,
+        "num_train_epochs": 50,
     }
 }
 

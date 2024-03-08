@@ -39,10 +39,7 @@ import ddpo
 from ddpo.utils.stat_tracking import PerPromptStatTracker
 from ddpo.diffusers_patch.scheduling_ddim_flax import FlaxDDIMScheduler
 from ddpo.diffusers_patch.pipeline_flax_stable_diffusion import FlaxStableDiffusionPipeline
-
-from diffusers.pipelines.stable_diffusion import FlaxStableDiffusionSafetyChecker
-from diffusers.utils import check_min_version
-from ddpo.datasets import DreamBoothDataset, PromptDataset
+from ddpo.training.images import DreamBoothDataset
 
 
 # Cache compiled models across invocations of this script.
@@ -163,13 +160,12 @@ def main():
     )
     # ----------------- Load the dataset ----------------- #
     print("Loading dataset...")
+
     train_dataset = DreamBoothDataset(
         instance_data_root=args.instance_data_dir,
-        instance_prompt=args.instance_prompt,
-        class_data_root=args.class_data_dir if args.with_prior_preservation else None,
-        class_prompt=args.class_prompt,
-        class_num=args.num_class_images,
-        tokenizer=pipeline.tokenizer,
+        class_data_root=None,
+        class_prompt=None,
+        class_num=None,
         size=args.resolution,
         center_crop=args.center_crop,
     )
@@ -198,14 +194,6 @@ def main():
             f" {len(train_dataset)} images. Please, use a larger dataset or reduce the effective batch size. Note that"
             f" there are {jax.local_device_count()} parallel devices, so your batch size can't be smaller than that."
         )
-
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, 
-        batch_size=n_devices * args.sample_batch_size, 
-        shuffle=True, 
-        collate_fn=collate_fn, 
-        drop_last=False
-    )
 
     # ----------------- Optimization ----------------- #
     print("Initializing optimizers and train state...")
@@ -254,7 +242,7 @@ def main():
     timer = ddpo.utils.Timer()
     # -------------------------- Functions ------------------------ #
     @partial(jax.pmap)
-    def vae_encode(images, vae_params, sample_rng):
+    def vae_encode(images, vae_params, sample_rng, generate=False):
         vae_outputs = pipeline.vae.apply(
             {"params": vae_params}, 
             images,
@@ -262,7 +250,8 @@ def main():
             method=pipeline.vae.encode
         )
         latents = vae_outputs.latent_dist.sample(sample_rng)
-        latents = jnp.transpose(latents, (0, 2, 3, 1))
+        if not generate:
+            latents = jnp.transpose(latents, (0, 2, 3, 1))
         latents = latents * 0.18215  # latent scale_factor, details: https://github.com/CompVis/stable-diffusion/blob/main/configs/stable-diffusion/v1-inference.yaml#L17
         return latents
 
@@ -312,8 +301,7 @@ def main():
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel & distributed) = {total_train_batch_size}")
+    logger.info(f"  Total train batch size (w. parallel & distributed) = {n_devices * args.sample_batch_size}")
 
     mean_rewards, std_rewards = [], []
     epochs = tqdm.tqdm(range(args.num_train_epochs), desc="Epoch ... ", position=0)
@@ -321,7 +309,9 @@ def main():
         # ------------------------- Prepare RL experience ----------------------- #
         print(f"Epoch {epoch + 1}, preparing RL experience...")
         experience = []
-        for i, batch in enumerate(train_dataloader):
+        for i in range(args.num_sample_batches_per_epoch):
+            image_batch = collate_fn(train_dataset.get_batch(n_devices * args.sample_batch_size))
+            print("image_batch.shape =", image_batch["pixel_values"].shape)
             # ------------------------- Make prompts ----------------------- #
             instance_prompts, class_prompts, prompts_metadata = ddpo.training.prompts.make_prompts(
                 args.prompt_fn,
@@ -352,8 +342,10 @@ def main():
                 eta=args.eta,
             )
             # ---------------------- Decode latents ---------------------- #
+            print(f"final_latents.shape = {final_latents.shape}")
             generate_images = vae_decode(final_latents, params["vae"])
             generate_images = jax.device_get(ddpo.utils.unshard(generate_images))
+            print(f"generate_images.shape = {generate_images.shape}")
             # ---------------------- Evaluate callbacks ---------------------- #
             callbacks = executor.submit(
                 ddpo.training.evaluate_callbacks,

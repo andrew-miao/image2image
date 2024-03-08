@@ -1,9 +1,9 @@
 from PIL import Image
 from pathlib import Path
-from torch.utils.data import Dataset
 from torchvision import transforms
+import numpy as np
 
-class DreamBoothDataset(Dataset):
+class DreamBoothDataset(object):
     """
     A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
     It pre-processes the images and the tokenizes prompts.
@@ -12,8 +12,6 @@ class DreamBoothDataset(Dataset):
     def __init__(
         self,
         instance_data_root,
-        instance_prompt,
-        tokenizer,
         class_data_root=None,
         class_prompt=None,
         class_num=None,
@@ -22,14 +20,12 @@ class DreamBoothDataset(Dataset):
     ):
         self.size = size
         self.center_crop = center_crop
-        self.tokenizer = tokenizer
         self.instance_data_root = Path(instance_data_root)
         if not self.instance_data_root.exists():
             raise ValueError("Instance images root doesn't exists.")
 
         self.instance_images_path = list(Path(instance_data_root).iterdir())
         self.num_instance_images = len(self.instance_images_path)
-        self.instance_prompt = instance_prompt
         self._length = self.num_instance_images
 
         if class_data_root is not None:
@@ -63,43 +59,20 @@ class DreamBoothDataset(Dataset):
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
         example["instance_images"] = self.image_transforms(instance_image)
-        example["instance_prompt_ids"] = self.tokenizer(
-            self.instance_prompt,
-            padding="do_not_pad",
-            truncation=True,
-            max_length=self.tokenizer.model_max_length,
-        ).input_ids
-
-        example["instance_prompts"] = self.instance_prompt
 
         if self.class_data_root:
             class_image = Image.open(self.class_images_path[index % self.num_class_images])
             if not class_image.mode == "RGB":
                 class_image = class_image.convert("RGB")
             example["class_images"] = self.image_transforms(class_image)
-            example["class_prompt_ids"] = self.tokenizer(
-                self.class_prompt,
-                padding="do_not_pad",
-                truncation=True,
-                max_length=self.tokenizer.model_max_length,
-            ).input_ids
-
             example["class_prompts"] = self.class_prompt
 
         return example
     
-class PromptDataset(Dataset):
-    "A simple dataset to prepare the prompts to generate class images on multiple GPUs."
-
-    def __init__(self, prompt, num_samples):
-        self.prompt = prompt
-        self.num_samples = num_samples
-
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, index):
-        example = {}
-        example["prompt"] = self.prompt
-        example["index"] = index
-        return example
+    def get_batch(self, batch_size):
+        batch = []
+        random_indices = np.random.choice(self._length, size=batch_size)
+        for index in random_indices:
+            example = self.__getitem__(index)
+            batch.append(example)
+        return batch

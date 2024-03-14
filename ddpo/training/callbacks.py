@@ -56,22 +56,71 @@ def vae_fn(devices=DEVICES, dtype="float32", jit=True):
 
     return shard_unshard(_fn)
 
-def mix_aesthetic_t2i_fn(devices=DEVICES, rng=0, cache="cache", jit=True, alpha=0.5):
+def mix_aesthetic_t2i_i2i_fn(devices=DEVICES, rng=0, cache="cache", jit=True, alpha=0.5):
+    cosine_similarity_callback = cosine_similarity_fn(devices=devices, rng=rng, cache=cache, jit=jit)
     aesthetic_callback = aesthetic_fn(devices=devices, rng=rng, cache=cache, jit=jit)
     consistency_callback = consistency_fn(devices=devices, jit=False)
     
-    def _mixture_fn(images, prompts, metadata):
+    def _mixture_fn(generated_images, instance_images, prompts, metadata):
+        # Compute cosine similarity score
+        cosine_similairty, _ = cosine_similarity_callback(generated_images, instance_images, prompts, metadata)
         # Compute the aesthetic score
-        aesthetic_score, _ = aesthetic_callback(images, prompts, metadata)
+        aesthetic_score, _ = aesthetic_callback(generated_images, instance_images, prompts, metadata)
         # Compute the consistency score
-        consistency_score, _ = consistency_callback(images, prompts, metadata)
+        consistency_score, _ = consistency_callback(generated_images, instance_images, prompts, metadata)
         
         # Combine the scores
-        mixture_score = alpha * jax.nn.tanh(aesthetic_score / 10.) \
-                     + (1 - alpha) * jax.nn.tanh(consistency_score / 10.)
+        mixture_score = cosine_similairty * 1.0 + jax.nn.tanh(aesthetic_score / 10.) * 0.0 \
+                     + jax.nn.tanh(consistency_score / 10.) * 0.0
         return mixture_score, {}
     
     return _mixture_fn
+
+def cosine_similarity_fn(devices=DEVICES, rng=0, cache="cache", jit=True):
+    model = transformers.FlaxCLIPModel.from_pretrained("openai/clip-vit-large-patch14")
+    processor = transformers.CLIPProcessor.from_pretrained(
+        "openai/clip-vit-large-patch14"
+    )
+
+    rng = jax.random.PRNGKey(rng)
+    embed_dim = 768
+    classifier = laion.AestheticClassifier()
+    params = classifier.init(rng, jnp.ones((1, embed_dim)))
+
+    repo_path = utils.get_repo_path()
+    weights = laion.load_weights(cache=os.path.join(repo_path, cache))
+    params = laion.set_weights(params, weights)
+
+    def _fn(generated_images, instance_images):
+        generated_features = model.get_image_features(pixel_values=generated_images)
+        instance_features = model.get_image_features(pixel_values=instance_images)
+
+        # normalize image features
+        generated_norm = jnp.linalg.norm(generated_features, axis=-1, keepdims=True)
+        instance_norm = jnp.linalg.norm(instance_features, axis=-1, keepdims=True)
+
+        generated_features = generated_features / generated_norm
+        instance_features = instance_features / instance_norm
+
+        # dot product
+        score = jnp.sum(generated_features * instance_features, axis=-1)
+        return score
+
+    if jit:
+        _fn = jax.pmap(_fn, axis_name="batch", devices=devices)
+
+    def _wrapper(generated_images, instance_images, prompts, metadata):
+        del metadata
+        generated_inputs = processor(images=list(generated_images), return_tensors="np")
+        generated_inputs = utils.shard(generated_inputs["pixel_values"])
+
+        instance_inputs = processor(images=list(instance_images), return_tensors="np")
+        instance_inputs = utils.shard(instance_inputs["pixel_values"])
+
+        output = _fn(generated_inputs, instance_inputs)
+        return utils.unshard(output), {}
+
+    return _wrapper
 
 def aesthetic_fn(devices=DEVICES, rng=0, cache="cache", jit=True):
     model = transformers.FlaxCLIPModel.from_pretrained("openai/clip-vit-large-patch14")
@@ -101,7 +150,7 @@ def aesthetic_fn(devices=DEVICES, rng=0, cache="cache", jit=True):
     if jit:
         _fn = jax.pmap(_fn, axis_name="batch", devices=devices)
 
-    def _wrapper(images, prompts, metadata):
+    def _wrapper(images, instance_images, prompts, metadata):
         del metadata
         inputs = processor(images=list(images), return_tensors="np")
         inputs = utils.shard(inputs["pixel_values"])
@@ -143,7 +192,7 @@ def consistency_fn(devices=DEVICES, jit=False):
         "openai/clip-vit-base-patch32"
     )
 
-    def _fn(images, prompts, metadata):
+    def _fn(images, instance_images, prompts, metadata):
         del metadata
         inputs = processor(
             text=prompts, images=list(images), return_tensors="np", padding=True
@@ -553,12 +602,12 @@ def llava_bertscore(devices=DEVICES, jit=False):
     return _fn
 
 
-def evaluate_callbacks(fns, images, prompts, metadata):
+def evaluate_callbacks(fns, images, instance_images, prompts, metadata):
     if type(prompts[0]) == list:
         prompts = [random.choice(p) for p in prompts]
 
     images = images.astype(jnp.float32)
-    outputs = {key: fn(images, prompts, metadata) for key, fn in fns.items()}
+    outputs = {key: fn(images, instance_images, prompts, metadata) for key, fn in fns.items()}
     return outputs
 
 
@@ -577,5 +626,5 @@ callback_fns = {
     "vqa": vqa_satisfaction,
     "llava_vqa": llava_vqa_satisfaction,
     "llava_bertscore": llava_bertscore,
-    "mix": mix_aesthetic_t2i_fn,
+    "mix": mix_aesthetic_t2i_i2i_fn,
 }

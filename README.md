@@ -13,6 +13,11 @@ This codebase has been tested on [Google Cloud TPUs](https://cloud.google.com/tp
 | `nouns_activities(assets/common_animals.txt, assets/activities_v0.txt)` | `llava_bertscore` | [ddpo-alignment](https://huggingface.co/kvablack/ddpo-alignment) |
 
 
+## Download Dataset
+```
+git clone https://github.com/google/dreambooth
+```
+
 ## Installation
 
 ```

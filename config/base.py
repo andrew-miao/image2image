@@ -160,7 +160,7 @@ dreambooth_dog = {
     },
     "dream_ppo": {
         "train_accumulation_steps": 2,
-        "instance_data_dir": "dog",
+        "instance_data_dir": "../../dreambooth/dataset/dog",
         "instance_prompt": "a photo of sks dog",
         "resolution": 512,
         "train_batch_size": 1,

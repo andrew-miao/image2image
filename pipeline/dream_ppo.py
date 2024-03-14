@@ -311,7 +311,6 @@ def main():
         experience = []
         for i in range(args.num_sample_batches_per_epoch):
             image_batch = collate_fn(train_dataset.get_batch(n_devices * args.sample_batch_size))
-            print("image_batch.shape =", image_batch["pixel_values"].shape)
             # ------------------------- Make prompts ----------------------- #
             instance_prompts, class_prompts, prompts_metadata = ddpo.training.prompts.make_prompts(
                 args.prompt_fn,
@@ -342,15 +341,17 @@ def main():
                 eta=args.eta,
             )
             # ---------------------- Decode latents ---------------------- #
-            print(f"final_latents.shape = {final_latents.shape}")
             generate_images = vae_decode(final_latents, params["vae"])
             generate_images = jax.device_get(ddpo.utils.unshard(generate_images))
-            print(f"generate_images.shape = {generate_images.shape}")
+            
             # ---------------------- Evaluate callbacks ---------------------- #
+            # reshape instance images (bz, 3, resolution, resolution) -> (bz, resolution, resolution, 3)
+            instance_images = jnp.transpose(image_batch["pixel_values"], (0, 2, 3, 1))
             callbacks = executor.submit(
                 ddpo.training.evaluate_callbacks,
                 callback_fns,
                 generate_images,
+                instance_images,
                 instance_prompts,
                 metadata=None
             )

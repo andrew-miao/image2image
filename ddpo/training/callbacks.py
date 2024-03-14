@@ -77,23 +77,17 @@ def mix_aesthetic_t2i_i2i_fn(devices=DEVICES, rng=0, cache="cache", jit=True, al
     return _mixture_fn
 
 def cosine_similarity_fn(devices=DEVICES, rng=0, cache="cache", jit=True):
-    model = transformers.FlaxCLIPModel.from_pretrained("openai/clip-vit-large-patch14")
-    processor = transformers.CLIPProcessor.from_pretrained(
-        "openai/clip-vit-large-patch14"
+    model = transformers.FlaxViTModel.from_pretrained("google/vit-base-patch16-224-in21k")
+    processor = transformers.ViTFeatureExtractor.from_pretrained(
+        "google/vit-base-patch16-224-in21k"
     )
 
-    rng = jax.random.PRNGKey(rng)
-    embed_dim = 768
-    classifier = laion.AestheticClassifier()
-    params = classifier.init(rng, jnp.ones((1, embed_dim)))
-
-    repo_path = utils.get_repo_path()
-    weights = laion.load_weights(cache=os.path.join(repo_path, cache))
-    params = laion.set_weights(params, weights)
-
     def _fn(generated_images, instance_images):
-        generated_features = model.get_image_features(pixel_values=generated_images)
-        instance_features = model.get_image_features(pixel_values=instance_images)
+        generated_features = model(generated_images)
+        instance_features = model(instance_images)
+
+        generated_features = generated_features.last_hidden_state[:, 0, :]
+        instance_features = instance_features.last_hidden_state[:, 0, :]
 
         # normalize image features
         generated_norm = jnp.linalg.norm(generated_features, axis=-1, keepdims=True)
@@ -111,10 +105,13 @@ def cosine_similarity_fn(devices=DEVICES, rng=0, cache="cache", jit=True):
 
     def _wrapper(generated_images, instance_images, prompts, metadata):
         del metadata
-        generated_inputs = processor(images=list(generated_images), return_tensors="np")
+        gen_images = generated_images.transpose(0, 3, 1, 2)
+        ins_images = instance_images.transpose(0, 3, 1, 2)
+
+        generated_inputs = processor(images=list(gen_images), return_tensors="np")
         generated_inputs = utils.shard(generated_inputs["pixel_values"])
 
-        instance_inputs = processor(images=list(instance_images), return_tensors="np")
+        instance_inputs = processor(images=list(ins_images), return_tensors="np")
         instance_inputs = utils.shard(instance_inputs["pixel_values"])
 
         output = _fn(generated_inputs, instance_inputs)

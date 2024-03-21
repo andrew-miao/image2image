@@ -117,7 +117,12 @@ def vae_similarity_fn(devices=DEVICES, rng=0, cache="cache", jit=True):
 
         generated_mean = generated_latent_dist.mean.reshape(generated_latent_dist.mean.shape[0], -1)
         instance_mean = instance_latent_dist.mean.reshape(instance_latent_dist.mean.shape[0], -1)
-        distance = jnp.mean((generated_mean - instance_mean) ** 2, axis=-1)
+
+        generated_logvar = generated_latent_dist.logvar.reshape(generated_latent_dist.logvar.shape[0], -1)
+        instance_logvar = instance_latent_dist.logvar.reshape(instance_latent_dist.logvar.shape[0], -1)
+
+        distance = jnp.mean((generated_mean - instance_mean) ** 2, axis=-1) \
+                    + jnp.mean((generated_logvar - instance_logvar) ** 2, axis=-1)
         return -distance
         # kl = tfp.distributions.kl_divergence(generated_gaussian, instance_gaussian)
         # len_shape = len(kl.shape)

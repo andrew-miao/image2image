@@ -10,9 +10,11 @@ from PIL import Image, ImageOps
 import diffusers
 import transformers
 import pdb
+from tensorflow_probability.substrates import jax as tfp
 
 from ddpo.models import laion
 from ddpo import utils
+
 
 DEVICES = jax.local_devices()
 
@@ -58,23 +60,90 @@ def vae_fn(devices=DEVICES, dtype="float32", jit=True):
 
 def mix_aesthetic_t2i_i2i_fn(devices=DEVICES, rng=0, cache="cache", jit=True, alpha=0.5):
     cosine_similarity_callback = cosine_similarity_fn(devices=devices, rng=rng, cache=cache, jit=jit)
-    aesthetic_callback = aesthetic_fn(devices=devices, rng=rng, cache=cache, jit=jit)
+    # TODO: debug aesthetic_fn
+    # aesthetic_callback = aesthetic_fn(devices=devices, rng=rng, cache=cache, jit=jit)
+    vae_similarity_callback = vae_similarity_fn(devices=devices, rng=rng, cache=cache, jit=jit)
     consistency_callback = consistency_fn(devices=devices, jit=False)
     
     def _mixture_fn(generated_images, instance_images, prompts, metadata):
         # Compute cosine similarity score
-        cosine_similairty, _ = cosine_similarity_callback(generated_images, instance_images, prompts, metadata)
+        # cosine_similairty, _ = cosine_similarity_callback(generated_images, instance_images, prompts, metadata)
+
+        # Compute vae similarity score
+        vae_similarity, _ = vae_similarity_callback(generated_images, instance_images, prompts, metadata)
+
         # Compute the aesthetic score
-        aesthetic_score, _ = aesthetic_callback(generated_images, instance_images, prompts, metadata)
+        # aesthetic_score, _ = aesthetic_callback(generated_images, instance_images, prompts, metadata)
         # Compute the consistency score
         consistency_score, _ = consistency_callback(generated_images, instance_images, prompts, metadata)
         
         # Combine the scores
-        mixture_score = cosine_similairty * 1.0 + jax.nn.tanh(aesthetic_score / 10.) * 0.0 \
+        mixture_score = vae_similarity * 1.0 +  \
                      + jax.nn.tanh(consistency_score / 10.) * 0.0
         return mixture_score, {}
     
     return _mixture_fn
+
+def vae_similarity_fn(devices=DEVICES, rng=0, cache="cache", jit=True):
+    vae, vae_params = diffusers.FlaxAutoencoderKL.from_pretrained(
+        "duongna/stable-diffusion-v1-4-flax", subfolder="vae", dtype="float32"
+    )
+
+    def _fn(generated_images, instance_images):
+        generated_vae_outputs = vae.apply(
+            {"params": vae_params},
+            generated_images,
+            deterministic=True,
+            method=vae.encode,
+        )
+        generated_latent_dist = generated_vae_outputs.latent_dist
+        generated_gaussian = tfp.distributions.Normal(
+            loc=generated_latent_dist.mean, scale=jnp.exp(generated_latent_dist.logvar / 2)
+        )
+
+        instance_vae_outputs = vae.apply(
+            {"params": vae_params},
+            instance_images,
+            deterministic=True,
+            method=vae.encode,
+        )
+        instance_latent_dist = instance_vae_outputs.latent_dist
+        instance_gaussian = tfp.distributions.Normal(
+            loc=instance_latent_dist.mean, scale=jnp.exp(instance_latent_dist.logvar / 2)
+        )
+
+        len_shape = len(generated_latent_dist.mean.shape)
+        axis = tuple(range(1, len_shape))
+
+        generated_mean = generated_latent_dist.mean.reshape(generated_latent_dist.mean.shape[0], -1)
+        instance_mean = instance_latent_dist.mean.reshape(instance_latent_dist.mean.shape[0], -1)
+        distance = jnp.mean((generated_mean - instance_mean) ** 2, axis=-1)
+        return -distance
+        # kl = tfp.distributions.kl_divergence(generated_gaussian, instance_gaussian)
+        # len_shape = len(kl.shape)
+        # axis = tuple(range(1, len_shape))
+        # kl_result = jnp.mean(kl, axis=axis)
+        # score = jnp.exp(-kl_result / 0.1)
+        # return score
+    
+    if jit:
+        _fn = jax.pmap(_fn, axis_name="batch", devices=devices)
+
+    def _wrapper(generated_images, instance_images, prompts, metadata):
+        del metadata
+        gen_images = generated_images.transpose(0, 3, 1, 2)
+        ins_images = instance_images.transpose(0, 3, 1, 2)
+
+        gen_images = normalize(gen_images, mean=0.5, std=0.5)
+        ins_images = normalize(ins_images, mean=0.5, std=0.5)
+
+        gen_images = utils.shard(gen_images)
+        ins_images = utils.shard(ins_images)
+        output = _fn(gen_images, ins_images)
+        return utils.unshard(output), {}
+
+    return _wrapper
+
 
 def cosine_similarity_fn(devices=DEVICES, rng=0, cache="cache", jit=True):
     model = transformers.FlaxViTModel.from_pretrained("google/vit-base-patch16-224-in21k")
@@ -118,6 +187,7 @@ def cosine_similarity_fn(devices=DEVICES, rng=0, cache="cache", jit=True):
         return utils.unshard(output), {}
 
     return _wrapper
+
 
 def aesthetic_fn(devices=DEVICES, rng=0, cache="cache", jit=True):
     model = transformers.FlaxCLIPModel.from_pretrained("openai/clip-vit-large-patch14")

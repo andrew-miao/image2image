@@ -241,19 +241,24 @@ def main():
     # -------------------------- Setup ------------------------#
     timer = ddpo.utils.Timer()
     # -------------------------- Functions ------------------------ #
+    def normalize(x, mean, std):
+        """
+        mirrors `torchvision.transforms.Normalize(mean, std)`
+        """
+        return (x - mean) / std
+
     @partial(jax.pmap)
-    def vae_encode(images, vae_params, sample_rng, generate=False):
+    def vae_encode(images, vae_params):
+        images = images.transpose(0, 3, 1, 2)
+        images = normalize(images, mean=0.5, std=0.5)
         vae_outputs = pipeline.vae.apply(
             {"params": vae_params}, 
             images,
             deterministic=True, 
             method=pipeline.vae.encode
         )
-        latents = vae_outputs.latent_dist.sample(sample_rng)
-        if not generate:
-            latents = jnp.transpose(latents, (0, 2, 3, 1))
-        latents = latents * 0.18215  # latent scale_factor, details: https://github.com/CompVis/stable-diffusion/blob/main/configs/stable-diffusion/v1-inference.yaml#L17
-        return latents
+        gaussian = vae_outputs.latent_dist
+        return gaussian.mean, gaussian.logvar
 
     @partial(jax.pmap)
     def vae_decode(latents, vae_params):
@@ -356,6 +361,7 @@ def main():
                 metadata=None
             )
             time.sleep(0)
+
             # Add experience to the buffer
             experience.append(
                 {   
@@ -382,7 +388,7 @@ def main():
                 args.filter_field
             ]
             del exp["callbacks"]
-
+        
         # Collate samples into a single dictionary
         # shape: (num_sample_batches_per_epoch * sample_batch_size * n_devices)
         experience = jax.tree_map(lambda *xs: np.concatenate(xs), *experience)

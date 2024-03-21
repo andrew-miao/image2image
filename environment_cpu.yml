@@ -31,3 +31,4 @@ dependencies:
     - matplotlib == 3.6.2
     - latex == 0.7.0
     - inflect == 7.0.0
+    - tensorflow-probability == 0.24.0

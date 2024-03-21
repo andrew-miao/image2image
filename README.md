@@ -28,7 +28,6 @@ pip install -e .
 
 ## Running DreamBooth PPO
 ```
-python pipeline/download_images.py
 python pipeline/dream_ppo.py --dataset="dreambooth_dog"
 ```
 

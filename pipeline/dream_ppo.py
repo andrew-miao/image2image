@@ -39,7 +39,7 @@ import ddpo
 from ddpo.utils.stat_tracking import PerPromptStatTracker
 from ddpo.diffusers_patch.scheduling_ddim_flax import FlaxDDIMScheduler
 from ddpo.diffusers_patch.pipeline_flax_stable_diffusion import FlaxStableDiffusionPipeline
-from ddpo.training.images import DreamBoothDataset
+from ddpo.training.datasets import DreamBoothDataset
 
 
 # Cache compiled models across invocations of this script.

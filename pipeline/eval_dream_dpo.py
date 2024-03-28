@@ -75,7 +75,7 @@ def main(step):
     images = pipeline(prompt_ids, params, test_seed, jit=True).images
     images = pipeline.numpy_to_pil(np.asarray(images.reshape((num_samples,) + images.shape[-3:])))
     for i, image in enumerate(images):
-        image_filename = local_path + f"{prompt}-{i}.jpg"
+        image_filename = local_path + f"{test_prompt}-{i}.jpg"
         image.save(image_filename)
                 
     print(f"Inference images saved to {local_path}")
@@ -83,4 +83,4 @@ def main(step):
     upload_images(local_path, args.bucket, "generated_images")
 
 if __name__ == "__main__":
-    main(step=10)
+    main(step=20)

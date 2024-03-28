@@ -8,6 +8,7 @@
 cache/
 dog/
 logs/
+pipeline/path-to-save-model
 
 # User-specific stuff
 .idea/**/workspace.xml

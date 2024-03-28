@@ -15,8 +15,8 @@ import transformers
 from flax import jax_utils
 from flax.training import train_state
 from flax.training.common_utils import shard
-from huggingface_hub import create_repo, upload_folder
 from huggingface_hub.utils import insecure_hashlib
+from huggingface_hub import create_repo, upload_folder
 from jax.experimental.compilation_cache import compilation_cache as cc
 from PIL import Image
 from torch.utils.data import Dataset
@@ -36,7 +36,7 @@ from diffusers.pipelines.stable_diffusion import FlaxStableDiffusionSafetyChecke
 from config import common_args
 from google.cloud import storage
 
-from ddpo.training.datasets import PromptDataset, DPODataset
+from datasets import PromptDataset, DPODataset
 
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -89,23 +89,25 @@ def main():
 
     # ------------------------ Generate sample images from pretrained model ------------------------ #
     generated_images_dir = args.generated_data_dir
-    generated_images= len(list(Path(generated_images_dir).iterdir()))
+    if not os.path.exists(generated_images_dir):
+        os.makedirs(generated_images_dir)
+    num_generated_images= len(list(Path(generated_images_dir).iterdir()))
 
-    if generated_images < args.num_generate_images:
+    if num_generated_images < args.num_generated_images:
         pipeline, params = FlaxStableDiffusionPipeline.from_pretrained(
             args.pretrained_model_name_or_path, safety_checker=None, revision=args.revision
         )
         pipeline.set_progress_bar_config(disable=True)
 
-        num_new_images = args.num_generate_images - generated_images
-        logger.info(f"Number of class images to sample: {num_new_images}.")
+        num_new_images = args.num_generated_images - num_generated_images
+        logger.info(f"Number of generated images to sample: {num_new_images}.")
 
         sample_dataset = PromptDataset(args.prompt, num_new_images)
         total_sample_batch_size = args.sample_batch_size * jax.local_device_count()
         sample_dataloader = torch.utils.data.DataLoader(sample_dataset, batch_size=total_sample_batch_size)
 
         for example in tqdm(
-            sample_dataloader, desc="Generating class images", disable=not jax.process_index() == 0
+            sample_dataloader, desc="Generating images", disable=not jax.process_index() == 0
         ):  
             prompt_ids = pipeline.prepare_inputs(example["prompt"])
             prompt_ids = shard(prompt_ids)
@@ -118,22 +120,22 @@ def main():
 
             for i, image in enumerate(images):
                 hash_image = insecure_hashlib.sha1(image.tobytes()).hexdigest()
-                image_filename = generated_images_dir/f"{example['index'][i]}-{hash_image}.jpg"
+                image_filename = generated_images_dir + f"/{example['index'][i] + num_generated_images}-{hash_image}.jpg"
                 image.save(image_filename)
 
         del pipeline
 
-    # ------------------------ Upload images to Google Cloud ------------------------ #
-    upload_images(generated_images_dir, args.bucket, "class_images")
+        # ------------------------ Upload images to Google Cloud ------------------------ #
+        upload_images(generated_images_dir, args.bucket, "class_images")
 
     # Handle the repository creation
     if jax.process_index() == 0:
-        if args.output_dir is not None:
-            os.makedirs(args.output_dir, exist_ok=True)
+        if args.savepath is not None:
+            os.makedirs(args.savepath, exist_ok=True)
 
         if args.push_to_hub:
             repo_id = create_repo(
-                repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
+                repo_id=args.hub_model_id or Path(args.savepath).name, exist_ok=True, token=args.hub_token
             ).repo_id
 
     # Load the tokenizer and add the placeholder token as a additional special token
@@ -261,7 +263,7 @@ def main():
             feed_pixel_values = jnp.concatenate(
                 jnp.split(batch["pixel_values"], 2, axis=1), axis=0
             )
-
+            print(f"feed_pixel_values: {feed_pixel_values.shape}")
             # Convert images to latent space
             vae_outputs = vae.apply(
                 {"params": vae_params}, feed_pixel_values, deterministic=True, method=vae.encode
@@ -391,7 +393,7 @@ def main():
             feature_extractor=CLIPImageProcessor.from_pretrained("openai/clip-vit-base-patch32"),
         )
 
-        outdir = os.path.join(args.output_dir, str(step)) if step else args.output_dir
+        outdir = os.path.join(args.savepath, str(step)) if step else args.savepath
         print(f"Saving model to {outdir}")
         pipeline.save_pretrained(
             outdir,
@@ -407,7 +409,7 @@ def main():
             message = f"checkpoint-{step}" if step is not None else "End of training"
             upload_folder(
                 repo_id=repo_id,
-                folder_path=args.output_dir,
+                folder_path=args.savepath,
                 commit_message=message,
                 ignore_patterns=["step_*", "epoch_*"],
             )
@@ -441,6 +443,7 @@ def main():
         train_metric = jax_utils.unreplicate(train_metric)
 
         train_step_progress_bar.close()
+        print(f"Epoch... ({epoch + 1}/{args.num_train_epochs} | Loss: {train_metric['loss']})")
         epochs.write(f"Epoch... ({epoch + 1}/{args.num_train_epochs} | Loss: {train_metric['loss']})")
 
     if jax.process_index() == 0:

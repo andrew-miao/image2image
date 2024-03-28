@@ -138,7 +138,7 @@ def add_args(parser):
         ),
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
-    parser.add_argument("--bucket", type=str, default="ym_bucket", help="Google Cloud Bucket to store the data.")
+    parser.add_argument("--bucket", type=str, default="dpo_booth_bucket", help="Google Cloud Bucket to store the data.")
     # NEED A NEW BUCKET
     args = parser.parse_args()
 

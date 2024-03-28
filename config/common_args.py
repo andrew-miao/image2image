@@ -7,12 +7,6 @@ def add_args(parser):
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
-        "--pretrained_vae_name_or_path",
-        type=str,
-        default=None,
-        help="Path to pretrained vae or vae identifier from huggingface.co/models.",
-    )
-    parser.add_argument(
         "--revision",
         type=str,
         default=None,
@@ -51,7 +45,7 @@ def add_args(parser):
         default=8,
         help="The number of generated images to be used for training per device.",
     )
-    parser.add_argument("--dpo_kl", type=float, default=1.0, help="The weight of KL divergence in DPO.")
+    parser.add_argument("--dpo_beta", type=float, default=1.0, help="The weight of KL divergence in DPO.")
     parser.add_argument(
         "--savepath",
         type=str,
@@ -86,10 +80,10 @@ def add_args(parser):
     )
     parser.add_argument("--train_text_encoder", action="store_true", help="Whether to train the text encoder")
     parser.add_argument(
-        "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument(
-        "--sample_batch_size", type=int, default=2, help="Batch size (per device) for sampling images."
+        "--sample_batch_size", type=int, default=1, help="Batch size (per device) for sampling images."
     )
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument(

@@ -87,32 +87,6 @@ def main():
 
     rng = jax.random.PRNGKey(args.seed)
 
-    # DEBUG
-    # pipeline, params = FlaxStableDiffusionPipeline.from_pretrained(
-    #             args.pretrained_model_name_or_path, safety_checker=None, revision=args.revision
-    #         )
-    # pipeline.set_progress_bar_config(disable=True)
-    # sample_dataset = PromptDataset(args.class_prompt, 16)
-    # total_sample_batch_size = args.sample_batch_size * jax.local_device_count()
-    # sample_dataloader = torch.utils.data.DataLoader(sample_dataset, batch_size=total_sample_batch_size)
-    # for example in tqdm(
-    #                 sample_dataloader, desc="DEBUGGING", disable=not jax.process_index() == 0
-    # ):
-    #     print("example prompt:", example["prompt"])
-    #     prompt_ids = pipeline.prepare_inputs(example["prompt"])
-    #     print(f"prompt_ids.shape = {prompt_ids.shape}")
-    #     prompt_ids = shard(prompt_ids)
-    #     print(f"after shard prompt_ids.shape = {prompt_ids.shape}")
-    #     p_params = jax_utils.replicate(params)
-    #     rng = jax.random.split(rng)[0]
-    #     sample_rng = jax.random.split(rng, jax.device_count())
-    #     images = pipeline(prompt_ids, p_params, sample_rng, jit=True).images
-    #     print(f"type of images {type(images)}")
-    #     images = images.reshape((images.shape[0] * images.shape[1],) + images.shape[-3:])
-    #     images = pipeline.numpy_to_pil(np.array(images))
-    #     print(f"After type of images {type(images)}")
-    # del pipeline
-
     # ------------------------ Generate sample images from pretrained model ------------------------ #
     generated_images_dir = args.generated_data_dir
     generated_images= len(list(Path(generated_images_dir).iterdir()))
@@ -172,7 +146,7 @@ def main():
     else:
         raise NotImplementedError("No tokenizer specified!")
 
-    # Load the dataset
+    # ----------------------- Load the dataset ------------------------ #
     train_dataset = DPODataset(
         instance_data_root=args.instance_data_dir,
         generated_data_root=args.generated_data_dir,
@@ -183,14 +157,8 @@ def main():
     )
 
     def collate_fn(examples):
-        input_ids = [example["instance_prompt_ids"] for example in examples]
-        pixel_values = [example["instance_images"] for example in examples]
-
-        # Concat class and instance examples for prior preservation.
-        # We do this to avoid doing two forward passes.
-        if args.with_prior_preservation:
-            input_ids += [example["class_prompt_ids"] for example in examples]
-            pixel_values += [example["class_images"] for example in examples]
+        input_ids = [example["prompt_ids"] for example in examples]
+        pixel_values = [example["pixel_values"] for example in examples]
 
         pixel_values = torch.stack(pixel_values)
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
@@ -224,11 +192,7 @@ def main():
     elif args.mixed_precision == "bf16":
         weight_dtype = jnp.bfloat16
 
-    if args.pretrained_vae_name_or_path:
-        # TODO(patil-suraj): Upload flax weights for the VAE
-        vae_arg, vae_kwargs = (args.pretrained_vae_name_or_path, {"from_pt": True})
-    else:
-        vae_arg, vae_kwargs = (args.pretrained_model_name_or_path, {"subfolder": "vae", "revision": args.revision})
+    vae_arg, vae_kwargs = (args.pretrained_model_name_or_path, {"subfolder": "vae", "revision": args.revision})
 
     # Load models and create wrapper for stable diffusion
     text_encoder = FlaxCLIPTextModel.from_pretrained(
@@ -248,6 +212,8 @@ def main():
         dtype=weight_dtype,
         revision=args.revision,
     )
+    # Copy the parameters to have a reference
+    ref_unet_params = jax.tree_map(lambda x: x.copy(), unet_params)
 
     # Optimization
     if args.scale_lr:
@@ -290,12 +256,18 @@ def main():
             params = {"unet": unet_state.params}
 
         def compute_loss(params):
+            # pixel_values is of shape (N, 2 * C, H, W)
+            # reshape it to (2 * N, C, H, W)
+            feed_pixel_values = jnp.concatenate(
+                jnp.split(batch["pixel_values"], 2, axis=1), axis=0
+            )
+
             # Convert images to latent space
             vae_outputs = vae.apply(
-                {"params": vae_params}, batch["pixel_values"], deterministic=True, method=vae.encode
+                {"params": vae_params}, feed_pixel_values, deterministic=True, method=vae.encode
             )
             latents = vae_outputs.latent_dist.sample(sample_rng)
-            # (NHWC) -> (NCHW)
+            # (2 * N, H, W, C) -> (2 * N, C, H, W)
             latents = jnp.transpose(latents, (0, 3, 1, 2))
             latents = latents * vae.config.scaling_factor
 
@@ -310,6 +282,11 @@ def main():
                 0,
                 noise_scheduler.config.num_train_timesteps,
             )
+            # Make timesteps and noise same for both instances and generated images
+            split_noise = jnp.split(noise, 2, axis=0)[0]
+            noise = jnp.tile(split_noise, (2, 1, 1, 1))
+            split_timesteps = jnp.split(timesteps, 2, axis=0)[0]
+            timesteps = jnp.tile(split_timesteps, (2,))
 
             # Add noise to the latents according to the noise magnitude at each timestep
             # (this is the forward diffusion process)
@@ -324,6 +301,8 @@ def main():
                 encoder_hidden_states = text_encoder(
                     batch["input_ids"], params=text_encoder_state.params, train=False
                 )[0]
+            # Repeat the encoder hidden states for the two instances
+            encoder_hidden_states = jnp.tile(encoder_hidden_states, (2, 1, 1))
 
             # Predict the noise residual
             model_pred = unet.apply(
@@ -338,25 +317,23 @@ def main():
             else:
                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-            if args.with_prior_preservation:
-                # Chunk the noise and noise_pred into two parts and compute the loss on each part separately.
-                model_pred, model_pred_prior = jnp.split(model_pred, 2, axis=0)
-                target, target_prior = jnp.split(target, 2, axis=0)
+            # Get the difference for learned model
+            model_losses = jnp.mean(jnp.square(model_pred - target), axis=(1, 2, 3))
+            model_losses_i, model_losses_g = jnp.split(model_losses, 2, axis=0)
+            mdoel_diff = model_losses_i - model_losses_g
 
-                # Compute instance loss
-                loss = (target - model_pred) ** 2
-                loss = loss.mean()
-
-                # Compute prior loss
-                prior_loss = (target_prior - model_pred_prior) ** 2
-                prior_loss = prior_loss.mean()
-
-                # Add the prior loss to the instance loss.
-                loss = loss + args.prior_loss_weight * prior_loss
-            else:
-                loss = (target - model_pred) ** 2
-                loss = loss.mean()
-
+            # Get the reference prediction
+            ref_model_pred = unet.apply(
+                {"params": ref_unet_params}, noisy_latents, timesteps, encoder_hidden_states, train=False
+            ).sample
+            ref_losses = jnp.mean(jnp.square(ref_model_pred - target), axis=(1, 2, 3))
+            ref_losses_i, ref_losses_g = jnp.split(ref_losses, 2, axis=0)
+            ref_diff = ref_losses_i - ref_losses_g
+            
+            # Compute the loss
+            scale_term = -0.5 * args.dpo_beta
+            inside_term = scale_term * (mdoel_diff - ref_diff)
+            loss = -jnp.mean(jax.nn.log_sigmoid(inside_term))
             return loss
 
         grad_fn = jax.value_and_grad(compute_loss)

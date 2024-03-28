@@ -142,12 +142,17 @@ class DPODataset(Dataset):
         instance_image = Image.open(self.instance_images_path[index % self.num_instance_images])
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
-        example["instance_images"] = self.image_transforms(instance_image)
 
         generated_image = Image.open(self.generated_images_path[index % self.num_generated_images])
         if not generated_image.mode == "RGB":
             generated_image = generated_image.convert("RGB")
-        example["generated_images"] = self.image_transforms(generated_image)
+
+        pixel_values = torch.cat(
+            self.image_transforms(instance_image), 
+            self.image_transforms(generated_image),
+            dim=0
+        )
+        example["pixel_values"] = pixel_values
 
         return example
     

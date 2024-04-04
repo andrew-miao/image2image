@@ -323,9 +323,7 @@ def main():
             # Get the difference for learned model
             model_losses = jnp.mean(jnp.square(model_pred - target), axis=(1, 2, 3))
             model_losses_i, model_losses_g = jnp.split(model_losses, 2, axis=0)
-            diff = model_losses_g - model_losses_i
-            labels = jnp.ones_like(diff) / args.dpo_beta
-            loss = jnp.mean(jnp.square(diff - labels))
+            model_diff = model_losses_g - model_losses_i
             # mdoel_diff = model_losses_i - model_losses_g
 
             # Get the reference prediction
@@ -334,12 +332,16 @@ def main():
             # ).sample
             # ref_losses = jnp.mean(jnp.square(ref_model_pred - target), axis=(1, 2, 3))
             # ref_losses_i, ref_losses_g = jnp.split(ref_losses, 2, axis=0)
+            # ref_diff = ref_losses_g - ref_losses_i
             # ref_diff = ref_losses_i - ref_losses_g
             
             # Compute the loss
             # scale_term = -0.5 * args.dpo_beta
             # inside_term = scale_term * (mdoel_diff - ref_diff)
             # loss = -jnp.mean(jax.nn.log_sigmoid(inside_term))
+            labels = jnp.ones_like(model_diff) / args.dpo_beta
+            loss = jnp.mean(jnp.square(model_diff - labels))
+
             return loss
 
         grad_fn = jax.value_and_grad(compute_loss)
@@ -435,8 +437,8 @@ def main():
                 unet_state, text_encoder_state, vae_params, batch, train_rngs
             )
 
-            train_metric = jax_utils.unreplicate(train_metric)
-            running_loss = jax.device_get(train_metric["loss"])
+            train_metric_loss = jax_utils.unreplicate(train_metric["loss"])
+            running_loss = jax.device_get(train_metric_loss)
             avg_train_loss += running_loss
             train_metrics.append(running_loss)
 

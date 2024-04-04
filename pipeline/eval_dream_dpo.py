@@ -47,6 +47,7 @@ def upload_images(localpath, bucket_name, destination_blob_name):
 
 
 def main(step):
+    print(f"step = {step}", flush=True)
     args = parse_args()
     # ----------------------- Loading Models ----------------------- #
     def load_checkpoint(step):
@@ -83,4 +84,4 @@ def main(step):
     upload_images(local_path, args.bucket, "generated_images")
 
 if __name__ == "__main__":
-    main(step=20)
+    main(step=100)

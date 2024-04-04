@@ -12,7 +12,7 @@ python train_dream_dpo.py \
   --prompt="a photo of sks dog" \
   --resolution=512 \
   --train_batch_size=1 \
-  --learning_rate=2e-6 \
+  --learning_rate=5e-6 \
   --num_generated_images=64 \
   --max_train_steps=100 \
   --save_steps=20

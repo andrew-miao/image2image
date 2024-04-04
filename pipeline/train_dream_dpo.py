@@ -342,6 +342,8 @@ def main():
             labels = jnp.ones_like(model_diff) / args.dpo_beta
             loss = jnp.mean(jnp.square(model_diff - labels))
 
+            # TODO: Test new loss function: D_KL(p_data || p_theta) + alpha * (D_{KL}(p_bad || p_theta) - something with R_max / beta) ** 2
+
             return loss
 
         grad_fn = jax.value_and_grad(compute_loss)

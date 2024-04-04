@@ -14,5 +14,5 @@ python train_dream_dpo.py \
   --train_batch_size=1 \
   --learning_rate=5e-6 \
   --num_generated_images=100 \
-  --max_train_steps=50 \
-  --save_steps=10
+  --max_train_steps=200 \
+  --save_steps=50

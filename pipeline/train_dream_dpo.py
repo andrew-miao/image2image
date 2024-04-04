@@ -23,6 +23,7 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPImageProcessor, CLIPTokenizer, FlaxCLIPTextModel, set_seed
+from matplotlib import pyplot as plt
 
 from diffusers import (
     FlaxAutoencoderKL,
@@ -420,11 +421,11 @@ def main():
     global_step = 0
 
     epochs = tqdm(range(args.num_train_epochs), desc="Epoch ... ", position=0)
+    train_metrics = []
+    os.makedirs('figs', exist_ok=True)
     for epoch in epochs:
         # ======================== Training ================================
-
-        train_metrics = []
-
+        avg_train_loss = 0.0
         steps_per_epoch = len(train_dataset) // total_train_batch_size
         train_step_progress_bar = tqdm(total=steps_per_epoch, desc="Training...", position=1, leave=False)
         # train
@@ -433,7 +434,11 @@ def main():
             unet_state, text_encoder_state, train_metric, train_rngs = p_train_step(
                 unet_state, text_encoder_state, vae_params, batch, train_rngs
             )
-            train_metrics.append(train_metric)
+
+            train_metric = jax_utils.unreplicate(train_metric)
+            running_loss = jax.device_get(train_metric["loss"])
+            avg_train_loss += running_loss
+            train_metrics.append(running_loss)
 
             train_step_progress_bar.update(jax.local_device_count())
 
@@ -442,6 +447,15 @@ def main():
                 checkpoint(global_step)
             if global_step >= args.max_train_steps:
                 break
+
+            if global_step % 10 == 0:
+                avg_train_loss = avg_train_loss / 10
+                print(f"Step... ({global_step} | Loss: {avg_train_loss})")
+                avg_train_loss = 0.0
+                plt.plot(train_metrics, label="Train Loss")
+                plt.legend()
+                plt.savefig("figs/train_loss.png")
+                plt.clf()
 
         train_metric = jax_utils.unreplicate(train_metric)
 

@@ -10,6 +10,7 @@ dog/
 logs/
 pipeline/path-to-save-model
 figs/
+clock/
 
 # User-specific stuff
 .idea/**/workspace.xml

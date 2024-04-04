@@ -286,10 +286,10 @@ def main():
                 noise_scheduler.config.num_train_timesteps,
             )
             # Make timesteps and noise same for both instances and generated images
-            split_noise = jnp.split(noise, 2, axis=0)[0]
-            noise = jnp.tile(split_noise, (2, 1, 1, 1))
-            split_timesteps = jnp.split(timesteps, 2, axis=0)[0]
-            timesteps = jnp.tile(split_timesteps, (2,))
+            # split_noise = jnp.split(noise, 2, axis=0)[0]
+            # noise = jnp.tile(split_noise, (2, 1, 1, 1))
+            # split_timesteps = jnp.split(timesteps, 2, axis=0)[0]
+            # timesteps = jnp.tile(split_timesteps, (2,))
 
             # Add noise to the latents according to the noise magnitude at each timestep
             # (this is the forward diffusion process)
@@ -323,15 +323,15 @@ def main():
             # Get the difference for learned model
             model_losses = jnp.mean(jnp.square(model_pred - target), axis=(1, 2, 3))
             model_losses_i, model_losses_g = jnp.split(model_losses, 2, axis=0)
-            model_diff = model_losses_g - model_losses_i
+            # model_diff = model_losses_g - model_losses_i
             # mdoel_diff = model_losses_i - model_losses_g
 
             # Get the reference prediction
-            # ref_model_pred = unet.apply(
-            #     {"params": ref_unet_params}, noisy_latents, timesteps, encoder_hidden_states, train=False
-            # ).sample
-            # ref_losses = jnp.mean(jnp.square(ref_model_pred - target), axis=(1, 2, 3))
-            # ref_losses_i, ref_losses_g = jnp.split(ref_losses, 2, axis=0)
+            ref_model_pred = unet.apply(
+                {"params": ref_unet_params}, noisy_latents, timesteps, encoder_hidden_states, train=False
+            ).sample
+            ref_losses = jnp.mean(jnp.square(ref_model_pred - target), axis=(1, 2, 3))
+            ref_losses_i, ref_losses_g = jnp.split(ref_losses, 2, axis=0)
             # ref_diff = ref_losses_g - ref_losses_i
             # ref_diff = ref_losses_i - ref_losses_g
             
@@ -339,10 +339,11 @@ def main():
             # scale_term = -0.5 * args.dpo_beta
             # inside_term = scale_term * (mdoel_diff - ref_diff)
             # loss = -jnp.mean(jax.nn.log_sigmoid(inside_term))
-            labels = jnp.ones_like(model_diff) / args.dpo_beta
-            loss = jnp.mean(jnp.square(model_diff - labels))
-
-            # TODO: Test new loss function: D_KL(p_data || p_theta) + alpha * (D_{KL}(p_bad || p_theta) - something with R_max / beta) ** 2
+            positive_labels = jnp.ones_like(model_losses_i) / args.dpo_beta
+            negative_labels = -jnp.ones_like(model_losses_i) / args.dpo_beta
+            loss = jnp.mean(jnp.square(model_losses_i - ref_losses_i + positive_labels)) \
+                + jnp.mean(jnp.square(ref_losses_g - model_losses_g - negative_labels))
+            # loss = jnp.mean(jnp.square(model_diff - labels))
 
             return loss
 

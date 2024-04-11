@@ -64,7 +64,7 @@ def main(step):
     os.makedirs(local_path, exist_ok=True)
 
     pipeline, params = load_checkpoint(step)
-    test_prompt = 'a photo of sks cat is eating an apple'
+    test_prompt = 'a photo of sks clock in the table.'
     test_rng = jax.random.PRNGKey(0)
     num_samples = jax.device_count()
     prompt = num_samples * [test_prompt]
@@ -84,4 +84,4 @@ def main(step):
     upload_images(local_path, args.bucket, "generated_images")
 
 if __name__ == "__main__":
-    main(step=50)
+    main(step=120)

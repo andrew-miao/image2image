@@ -1,7 +1,7 @@
 export MODEL_NAME="duongna/stable-diffusion-v1-4-flax"
 export SAVE_DIR="path-to-save-model"
-export INSTANCE_DIR="../../dreambooth/dataset/cat"
-export GENERATE_DIR="generate/cat"
+export INSTANCE_DIR="../../dreambooth/dataset/clock"
+export GENERATE_DIR="generate/clock"
 
 python train_dream_dpo.py \
   --pretrained_model_name_or_path=$MODEL_NAME  \
@@ -9,10 +9,10 @@ python train_dream_dpo.py \
   --generated_data_dir=$GENERATE_DIR \
   --savepath=$SAVE_DIR \
   --dpo_beta=5.0 \
-  --prompt="a photo of sks cat" \
+  --prompt="a photo of sks clock" \
   --resolution=512 \
   --train_batch_size=1 \
   --learning_rate=5e-6 \
   --num_generated_images=64 \
-  --max_train_steps=200 \
-  --save_steps=50
+  --max_train_steps=120 \
+  --save_steps=40

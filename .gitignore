@@ -11,6 +11,7 @@ logs/
 pipeline/path-to-save-model
 figs/
 clock/
+generate/
 
 # User-specific stuff
 .idea/**/workspace.xml

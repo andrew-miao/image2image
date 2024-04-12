@@ -8,18 +8,6 @@ import numpy as np
 import transformers
 
 
-def load_process_images(image_path):
-    size = 512
-    image_transforms = transforms.Compose(
-            [
-                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-            ]
-    )
-    image = Image.open(image_path)
-    return image_transforms(image).unsqueeze(0).numpy()
-
 def cosine_similarity_fn(reference_images, compare_images):
     model = transformers.FlaxCLIPModel.from_pretrained("openai/clip-vit-base-patch32")
     processor = transformers.CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")

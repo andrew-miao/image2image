@@ -38,6 +38,7 @@ from config import common_args
 from google.cloud import storage
 
 from datasets import PromptDataset, DPODataset
+from compute_clip_distance import reward_fn, read_images
 
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -151,7 +152,7 @@ def main():
 
     # ----------------------- Load the dataset ------------------------ #
     train_dataset = DPODataset(
-        instance_data_root=args.instance_data_dir,
+        reference_data_root=args.reference_data_dir,
         generated_data_root=args.generated_data_dir,
         prompt=args.prompt,
         tokenizer=tokenizer,
@@ -162,9 +163,11 @@ def main():
     def collate_fn(examples):
         input_ids = [example["prompt_ids"] for example in examples]
         pixel_values = [example["pixel_values"] for example in examples]
+        rewards = [example["rewards"] for example in examples]
 
         pixel_values = torch.stack(pixel_values)
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+        rewards = torch.stack(rewards)
 
         input_ids = tokenizer.pad(
             {"input_ids": input_ids}, padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt"
@@ -173,6 +176,7 @@ def main():
         batch = {
             "input_ids": input_ids,
             "pixel_values": pixel_values,
+            "rewards": rewards,
         }
         batch = {k: v.numpy() for k, v in batch.items()}
         return batch
@@ -284,7 +288,7 @@ def main():
                 0,
                 noise_scheduler.config.num_train_timesteps,
             )
-            # Make timesteps and noise same for both instances and generated images
+            # Make timesteps and noise same for both references and generated images
             split_noise = jnp.split(noise, 2, axis=0)[0]
             noise = jnp.tile(split_noise, (2, 1, 1, 1))
             split_timesteps = jnp.split(timesteps, 2, axis=0)[0]
@@ -303,7 +307,7 @@ def main():
                 encoder_hidden_states = text_encoder(
                     batch["input_ids"], params=text_encoder_state.params, train=False
                 )[0]
-            # Repeat the encoder hidden states for the two instances
+            # Repeat the encoder hidden states for the two references
             encoder_hidden_states = jnp.tile(encoder_hidden_states, (2, 1, 1))
 
             # Predict the noise residual
@@ -338,9 +342,9 @@ def main():
             # scale_term = -0.5 * args.dpo_beta
             # inside_term = scale_term * (mdoel_diff - ref_diff)
             # loss = -jnp.mean(jax.nn.log_sigmoid(inside_term))
-            labels = jnp.ones_like(model_losses_g) / args.dpo_beta
+            reward_diff = (jnp.ones_like(model_losses_g) - batch["rewards"])
             loss = jnp.mean(model_losses_i) + jnp.mean(
-                jnp.square(labels + ref_diff - model_losses_g)
+                jnp.square(reward_diff + ref_diff - model_losses_g)
             )
             # loss = jnp.mean(jnp.square(model_diff - labels))
 
@@ -360,6 +364,36 @@ def main():
         metrics = jax.lax.pmean(metrics, axis_name="batch")
 
         return new_unet_state, new_text_encoder_state, metrics, new_train_rng
+
+    def evaluate_step(unet_state, text_encoder_state, vae_params, save_path, step):
+        pipeline, params = FlaxStableDiffusionPipeline.from_pretrained(
+            args.pretrained_model_name_or_path, safety_checker=None, revision=args.revision
+        )
+        
+        params["text_encoder"] = jax_utils.unreplicate(text_encoder_state.params)
+        params["vae"] = jax_utils.unreplicate(vae_params)
+        params["unet"] = jax_utils.unreplicate(unet_state.params)
+
+        params = jax_utils.replicate(params)
+
+        prompt = args.prompt
+        num_samples = jax.device_count()
+        prompt = num_samples * [prompt]
+        prompt_ids = pipeline.prepare_inputs(prompt)
+
+        eval_rng = jax.random.PRNGKey(0)
+        eval_seed = jax.random.split(eval_rng, num_samples)
+        prompt_ids = shard(prompt_ids)
+        images = pipeline(prompt_ids, params, eval_seed, jit=True).images
+        images = pipeline.numpy_to_pil(np.asarray(images.reshape((num_samples,) + images.shape[-3:])))
+        for i, image in enumerate(images):
+            image_filename = save_path + f"{prompt}-{step}-{i}.jpg"
+            image.save(image_filename)
+
+        reference_images = read_images(args.reference_data_dir)
+        compare_images = read_images(save_path)
+        rewards = reward_fn(reference_images, compare_images)
+        return np.mean(rewards)
 
     # Create parallel version of the train step
     p_train_step = jax.pmap(train_step, "batch", donate_argnums=(0, 1))
@@ -427,6 +461,7 @@ def main():
     epochs = tqdm(range(args.num_train_epochs), desc="Epoch ... ", position=0)
     train_metrics = []
     os.makedirs('figs', exist_ok=True)
+    os.makedirs('validate/', exist_ok=True)
     for epoch in epochs:
         # ======================== Training ================================
         avg_train_loss = 0.0
@@ -439,10 +474,10 @@ def main():
                 unet_state, text_encoder_state, vae_params, batch, train_rngs
             )
 
-            train_metric_loss = jax_utils.unreplicate(train_metric["loss"])
-            running_loss = jax.device_get(train_metric_loss)
-            avg_train_loss += running_loss
-            train_metrics.append(running_loss)
+            # train_metric_loss = jax_utils.unreplicate(train_metric["loss"])
+            # running_loss = jax.device_get(train_metric_loss)
+            # avg_train_loss += running_loss
+            # train_metrics.append(running_loss)
 
             train_step_progress_bar.update(jax.local_device_count())
 
@@ -453,19 +488,26 @@ def main():
                 break
 
             if global_step % 10 == 0:
-                avg_train_loss = avg_train_loss / 10
-                print(f"Step... ({global_step} | Loss: {avg_train_loss})")
-                avg_train_loss = 0.0
-                plt.plot(train_metrics, label="Train Loss")
+                rewards = evaluate_step(unet_state, text_encoder_state, vae_params, "validate/", global_step)
+                print(f"average reward for validation: {rewards:.4f}")
+                train_metrics.append(rewards)
+                plt.plot(train_metrics, label="Validation Reward")
                 plt.legend()
-                plt.savefig("figs/train_loss.png")
+                plt.savefig("figs/validate_reward.png")
                 plt.clf()
+                # avg_train_loss = avg_train_loss / 10
+                # print(f"Step... ({global_step} | Loss: {avg_train_loss})")
+                # avg_train_loss = 0.0
+                # plt.plot(train_metrics, label="Train Loss")
+                # plt.legend()
+                # plt.savefig("figs/train_loss.png")
+                # plt.clf()
 
         train_metric = jax_utils.unreplicate(train_metric)
 
         train_step_progress_bar.close()
-        print(f"Epoch... ({epoch + 1}/{args.num_train_epochs} | Loss: {train_metric['loss']})")
-        epochs.write(f"Epoch... ({epoch + 1}/{args.num_train_epochs} | Loss: {train_metric['loss']})")
+        # print(f"Epoch... ({epoch + 1}/{args.num_train_epochs} | Loss: {train_metric['loss']})")
+        # epochs.write(f"Epoch... ({epoch + 1}/{args.num_train_epochs} | Loss: {train_metric['loss']})")
 
     if jax.process_index() == 0:
         checkpoint()

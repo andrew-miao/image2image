@@ -9,11 +9,13 @@ cache/
 dog/
 logs/
 pipeline/path-to-save-model
-figs/
+pipeline/figs
 clock/
 generate/
+validate/
 
 .jpg
+.png
 
 # User-specific stuff
 .idea/**/workspace.xml

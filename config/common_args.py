@@ -20,11 +20,11 @@ def add_args(parser):
         help="Pretrained tokenizer name or path if not the same as model_name",
     )
     parser.add_argument(
-        "--instance_data_dir",
+        "--reference_data_dir",
         type=str,
         default=None,
         required=True,
-        help="A folder containing the training data of instance images.",
+        help="A folder containing the training data of reference images.",
     )
     parser.add_argument(
         "--generated_data_dir",
@@ -37,7 +37,7 @@ def add_args(parser):
         "--prompt",
         type=str,
         default="A photo of sks dog",
-        help="The prompt with identifier specifying the instance",
+        help="The prompt with identifier specifying the reference",
     )
     parser.add_argument(
         "--num_generated_images",

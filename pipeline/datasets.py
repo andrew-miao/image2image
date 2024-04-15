@@ -4,6 +4,7 @@ from torchvision import transforms
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from compute_clip_distance import reward_fn, read_images
 
 class DreamBoothDataset(object):
     """
@@ -80,15 +81,15 @@ class DreamBoothDataset(object):
     
 class DPODataset(Dataset):
     """
-    A dataset to prepare the instance and generated images with the prompts for fine-tuning the model.
+    A dataset to prepare the reference and generated images with the prompts for fine-tuning the model.
     """
     """
-    A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
+    A dataset to prepare the reference and class images with the prompts for fine-tuning the model.
     It pre-processes the images and the tokenizes prompts.
     """
     def __init__(
         self,
-        instance_data_root,
+        reference_data_root,
         generated_data_root,
         prompt,
         tokenizer,
@@ -99,15 +100,15 @@ class DPODataset(Dataset):
         self.center_crop = center_crop
         self.tokenizer = tokenizer
 
-        # Load the instance images
-        self.instance_data_root = Path(instance_data_root)
-        if not self.instance_data_root.exists():
-            raise ValueError("Instance images root doesn't exists.")
+        # Load the reference images
+        self.reference_data_root = Path(reference_data_root)
+        if not self.reference_data_root.exists():
+            raise ValueError("reference images root doesn't exists.")
 
-        self.instance_images_path = list(Path(instance_data_root).iterdir())
-        self.num_instance_images = len(self.instance_images_path)
+        self.reference_images_path = list(Path(reference_data_root).iterdir())
+        self.num_reference_images = len(self.reference_images_path)
         self.prompt = prompt
-        self._length = self.num_instance_images
+        self._length = self.num_reference_images
 
         # Load the generated images
         self.generated_data_root = Path(generated_data_root)
@@ -116,7 +117,12 @@ class DPODataset(Dataset):
         
         self.generated_images_path = list(Path(generated_data_root).iterdir())
         self.num_generated_images = len(self.generated_images_path)
-        self._length = max(self.num_generated_images, self.num_instance_images)
+        self._length = max(self.num_generated_images, self.num_reference_images)
+
+        # Compute the reward
+        reference_images = read_images(reference_data_root)
+        generated_images = read_images(generated_data_root)
+        self.rewards = reward_fn(reference_images, generated_images)
 
         self.image_transforms = transforms.Compose(
             [
@@ -139,21 +145,22 @@ class DPODataset(Dataset):
             max_length=self.tokenizer.model_max_length,
         ).input_ids
 
-        instance_image = Image.open(self.instance_images_path[index % self.num_instance_images])
-        if not instance_image.mode == "RGB":
-            instance_image = instance_image.convert("RGB")
+        reference_image = Image.open(self.reference_images_path[index % self.num_reference_images])
+        if not reference_image.mode == "RGB":
+            reference_image = reference_image.convert("RGB")
 
         generated_image = Image.open(self.generated_images_path[index % self.num_generated_images])
         if not generated_image.mode == "RGB":
             generated_image = generated_image.convert("RGB")
 
-
         pixel_values = torch.cat(
-            (self.image_transforms(instance_image), 
+            (self.image_transforms(reference_image), 
             self.image_transforms(generated_image)),
             dim=0
         )
         example["pixel_values"] = pixel_values
+        rewards = self.rewards[index % self.num_generated_images]
+        example["rewards"] = torch.from_numpy(np.array(rewards))
 
         return example
     
